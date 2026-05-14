@@ -1,0 +1,107 @@
+# --- Data: never commit ---
+*.zarr/
+*.zarr
+*.n5/
+*.n5
+*.nii
+*.nii.gz
+*.nrrd
+*.tif
+*.tiff
+*.h5
+*.hdf5
+*.mha
+*.mhd
+*.raw
+*.npy
+*.npz
+
+# Transforms / per-run JSON
+transform.json
+transform_*.json
+identity.json
+*.transform.json
+
+# Output directories
+out/
+out_*/
+brainreg_out/
+brainreg_out_*/
+work/
+results/
+
+# brainreg artifacts that may land alongside the scripts
+boundaries.tiff
+deformation_field_*.tiff
+downsampled.tiff
+downsampled_standard.tiff
+registered_atlas.tiff
+registered_hemispheres.tiff
+volumes.csv
+brainreg.json
+brainreg_*.log
+
+# Atlas caches (downloaded by brainglobe-atlasapi, can be regenerated)
+.brainglobe/
+allen_ccf/
+allen_atlas*/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# --- Environments ---
+.env
+.venv
+env/
+venv/
+ENV/
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# --- Logs & temporary ---
+*.log
+*.tmp
+*.bak
+.cache/

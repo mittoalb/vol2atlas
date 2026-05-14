@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zrot"
+version = "0.1.0"
+description = "Interactive rigid alignment of large OME-Zarr volumes to the Allen CCF"
+requires-python = ">=3.10"
+dependencies = [
+    "zarr>=2.16,<3",
+    "ome-zarr>=0.9",
+    "dask[array]>=2024.1",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "napari[all]>=0.4.19",
+    "magicgui>=0.8",
+    "brainglobe-atlasapi>=2.0",
+    "typer>=0.12",
+    "nibabel>=5.0",
+    "tifffile>=2024.1",
+]
+
+[project.scripts]
+zrot-align = "zrot.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
