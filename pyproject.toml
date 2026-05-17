@@ -18,6 +18,7 @@ dependencies = [
     "brainglobe-atlasapi>=2.0",
     "typer>=0.12",
     "nibabel>=5.0",
+    "tifffile>=2024.1",  # reading brainreg's downsampled_standard.tiff
 ]
 
 [project.scripts]

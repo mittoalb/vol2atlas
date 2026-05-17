@@ -113,6 +113,61 @@ def export(
 
 
 @app.command()
+def ants(
+    export_dir: Path = typer.Argument(...,
+        help="Output dir of a previous `zrot export` run."),
+    out_dir: Path = typer.Option(Path("out/ants"), "--out", "-o"),
+    transform_type: str = typer.Option(
+        "SyNOnly", "--transform",
+        help="ANTs transform: 'SyNOnly' (recommended), 'SyN', 'Affine', etc. "
+             "SyN re-runs rigid+affine and overwrites the prealignment — "
+             "stick with SyNOnly unless you have a reason."),
+    reg_iter_high:   int = typer.Option(10, "--iter-high"),
+    reg_iter_mid:    int = typer.Option(5,  "--iter-mid"),
+    reg_iter_low:    int = typer.Option(0,  "--iter-low"),
+    flow_sigma:    float = typer.Option(6.0, "--flow-sigma"),
+    total_sigma:   float = typer.Option(2.0, "--total-sigma"),
+    state: Path  = typer.Option(Path("state.json"), "--state", "-s",
+                                 help="State file to log this run into."),
+    skip_view:     bool = typer.Option(False, "--skip-view"),
+):
+    """Refine a `zrot export` output with ANTs SyNOnly + brain masks."""
+    from .steps.refine_ants import run
+    run(export_dir, out_dir,
+        transform_type=transform_type,
+        reg_iterations=(reg_iter_high, reg_iter_mid, reg_iter_low),
+        flow_sigma=flow_sigma, total_sigma=total_sigma,
+        state_path=state, skip_view=skip_view)
+
+
+@app.command()
+def brainreg(
+    export_dir: Path = typer.Argument(...,
+        help="Output dir of a previous `zrot export` run."),
+    out_dir: Path = typer.Option(Path("out/brainreg"), "--out", "-o"),
+    atlas: str   = typer.Option("allen_mouse_25um", "--atlas"),
+    orientation: str = typer.Option(
+        "asr", "--orientation",
+        help="brainglobe orientation of the prealigned input. For an "
+             "atlas-native export this matches the atlas (asr for "
+             "allen_mouse_25um)."),
+    brain_geometry: str = typer.Option(
+        "full", "--brain-geometry",
+        help="brainreg --brain_geometry: full / hemisphere_l / hemisphere_r. "
+             "Partial samples do NOT match any of these well."),
+    state: Path  = typer.Option(Path("state.json"), "--state", "-s"),
+    skip_view: bool = typer.Option(False, "--skip-view"),
+):
+    """Refine a `zrot export` output with BrainGlobe brainreg.
+
+    NOTE: brainreg assumes a full brain or a complete hemisphere; on a
+    partial sample it will distort to fill the missing region."""
+    from .steps.refine_brainreg import run
+    run(export_dir, out_dir, atlas_name=atlas, orientation=orientation,
+        brain_geometry=brain_geometry, state_path=state, skip_view=skip_view)
+
+
+@app.command()
 def info(zarr_path: Path = typer.Argument(...)):
     """Print the OME-Zarr pyramid structure."""
     from .io import open_multiscale
