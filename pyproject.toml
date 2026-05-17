@@ -18,11 +18,10 @@ dependencies = [
     "brainglobe-atlasapi>=2.0",
     "typer>=0.12",
     "nibabel>=5.0",
-    "tifffile>=2024.1",
 ]
 
 [project.scripts]
-zrot-align = "zrot.cli:app"
+zrot = "zrot.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]

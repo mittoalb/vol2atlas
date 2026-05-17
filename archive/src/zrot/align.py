@@ -108,6 +108,7 @@ def align_interactive(
     save_to: str | Path | None = None,
     preview_max_voxels: int = 256 * 256 * 256,   # ~16M voxels => ~32 MB uint16
     ndisplay: int = 2,
+    voxel_um_override: tuple[float, float, float] | None = None,
 ) -> RigidTransform:
     """Open a napari window to align `sample` (at pyramid `level`) onto the CCF.
 
@@ -137,6 +138,10 @@ def align_interactive(
             )
         arr = da.take(arr, channel, axis=c_axis)
     sample_um = ms.spacing(level)
+    if voxel_um_override is not None:
+        print(f"[zrot] voxel size override: {sample_um} → {voxel_um_override} µm",
+              flush=True)
+        sample_um = tuple(float(v) for v in voxel_um_override)
 
     # ---- downsample into a RAM preview (avoids dask MIP hangs) -----------
     spatial = arr.shape[-3:]
@@ -217,30 +222,35 @@ def align_interactive(
         opacity=0.6,
         blending="additive",
     )
-    # interpolation 'nearest' is much faster for non-orthogonal slicing of
-    # large previews. The dragging stays responsive; when you let go you can
-    # toggle to 'linear' from the layer controls panel for a final visual check.
-    sample_layer = viewer.add_image(
-        sample_np,
-        name=f"sample (level {level})",
-        scale=sample_um,
-        colormap="magenta",
-        rendering="mip",
-        contrast_limits=sample_clim,
-        opacity=0.6,
-        blending="additive",
-        interpolation2d="nearest",
-        interpolation3d="nearest",
-    )
 
+    # ---- landmark layers (always visible, in world µm) -----------------
+    # SAMPLE landmarks are stored in sample-µm internally; their displayed
+    # position is updated to current transform on every slider change.
+    # CCF landmarks live in CCF-µm and never move.
+    # Points-layer `size` is in DATA units, which is per-layer:
+    #   - sample_lm_layer has scale=(1,1,1) → data unit = world µm. Size in µm.
+    #   - ccf_lm_layer    has scale=ccf.voxel_um → data unit = voxels.
+    # Both should look the same physical size on screen (~150 µm).
+    _PHYS_LM_UM = 150.0
+    sample_lm_layer = viewer.add_points(
+        np.empty((0, 3)), ndim=3, scale=(1.0, 1.0, 1.0),
+        name="sample landmarks (cyan)", face_color="cyan",
+        border_color="white", size=_PHYS_LM_UM,
+    )
+    ccf_lm_layer = viewer.add_points(
+        np.empty((0, 3)), ndim=3, scale=ccf.voxel_um,
+        name="ccf landmarks (yellow)", face_color="yellow",
+        border_color="white", size=_PHYS_LM_UM / ccf.voxel_um[0],
+    )
+    landmarks_sample_um: list[tuple[float, float, float]] = []
+    landmarks_ccf_um: list[tuple[float, float, float]] = []
     # ---- WYSIWYG truth layer ---------------------------------------------
-    # The only "live" view IS the scipy resample. There is no fake affine
-    # render anymore. Slider change → debounced (200 ms) recompute → display.
-    # Slower per tick but always honest: what you see = what gets saved.
+    # The ONLY sample layer is the scipy resample onto the CCF voxel grid.
+    # No fake-affine layer that could confuse you by appearing in the layer
+    # list. Slider change → debounced (200 ms) recompute → display.
     from scipy.ndimage import affine_transform as _scipy_affine
     from qtpy.QtCore import QTimer
 
-    sample_layer.visible = False    # hide the lying affine layer permanently
     state["prewarp_layer"] = None
     state["prewarp_timer"] = QTimer()
     state["prewarp_timer"].setSingleShot(True)
@@ -270,10 +280,16 @@ def align_interactive(
     state["prewarp_timer"].timeout.connect(_refresh_prewarp_now)
 
     def _apply():
-        # No more cosmetic affine; schedule the truthful recompute.
+        # Schedule the truthful resample, and update sample-landmark positions
+        # (they're stored in sample µm; their displayed world coord moves with
+        # the transform).
         state["prewarp_timer"].start(200)   # debounce, restarts on each call
+        try: _refresh_sample_display()
+        except NameError: pass   # before lm panel exists, on first _apply()
 
-    _apply()
+    # Eagerly create the layer so shift+drag etc. can attach callbacks.
+    _refresh_prewarp_now()
+    sample_layer = state["prewarp_layer"]   # alias for backward-compat below
 
     # ---- DELTA sliders: 0 = current pose; ± nudges from there ------------
     # Slider value is a *delta* from `baseline`. The applied transform is
@@ -517,14 +533,285 @@ def align_interactive(
         except Exception:
             pass
 
-    # No prewarp toggle — the only view IS the truthful resample.
+    # ---- landmark panel ------------------------------------------------
+    # Two lists (sample / CCF), plus "Add sample" / "Add CCF" buttons that
+    # arm the next canvas click. Pairing is by row index.
+    from qtpy.QtWidgets import (QListWidget, QListWidgetItem, QSplitter,
+                                 QGroupBox, QPushButton)
 
-    viewer.window.add_dock_widget(abs_label, name="absolute pose", area="right")
-    viewer.window.add_dock_widget(controls_widget, name="Δ from baseline", area="right")
-    viewer.window.add_dock_widget(jog, name="jog Δ", area="right")
-    viewer.window.add_dock_widget(commit_btn, name="commit", area="right")
-    viewer.window.add_dock_widget(save_btn, name="save", area="right")
-    viewer.window.add_dock_widget(reset_btn, name="reset Δ", area="right")
+    state["pending_lm_type"] = None   # None | 'sample' | 'ccf'
+
+    def _refresh_sample_display():
+        if not landmarks_sample_um:
+            sample_lm_layer.data = np.empty((0, 3))
+            return
+        M = state["transform"].matrix()
+        pts = np.asarray(landmarks_sample_um)
+        world = (M[:3, :3] @ pts.T).T + M[:3, 3]
+        sample_lm_layer.data = world
+
+    def _refresh_ccf_display():
+        if not landmarks_ccf_um:
+            ccf_lm_layer.data = np.empty((0, 3))
+            return
+        # ccf_lm_layer has scale=ccf.voxel_um, so data = world / scale = voxel idx
+        pts = np.asarray(landmarks_ccf_um)
+        ccf_lm_layer.data = pts / np.asarray(ccf.voxel_um)
+
+    def _refresh_lists():
+        sample_list.clear()
+        for i, (z, y, x) in enumerate(landmarks_sample_um):
+            sample_list.addItem(f"#{i}  z={z:+8.1f}  y={y:+8.1f}  x={x:+8.1f} µm")
+        ccf_list.clear()
+        for i, (z, y, x) in enumerate(landmarks_ccf_um):
+            ccf_list.addItem(f"#{i}  z={z:+8.1f}  y={y:+8.1f}  x={x:+8.1f} µm")
+
+    def _add_lm_after_click(kind: str):
+        state["pending_lm_type"] = kind
+        viewer.status = (f"click on a {kind.upper()} feature in the canvas "
+                         f"(one click adds it, then stops)")
+        if kind == "sample":
+            add_sample_btn.setStyleSheet("background-color: #225588;")
+        else:
+            add_ccf_btn.setStyleSheet("background-color: #886600;")
+
+    @viewer.mouse_drag_callbacks.append
+    def _capture_click(_viewer, event):
+        if state["pending_lm_type"] is None:
+            return
+        # Robust 3D world position from the click: take the current dims.point
+        # (which has the slice positions for non-displayed axes) and override
+        # the DISPLAYED axes with the cursor coordinates from event.position.
+        slice_pos = list(viewer.dims.point)
+        displayed = viewer.dims.displayed
+        cursor = np.asarray(event.position, dtype=float)
+        if cursor.size == len(displayed):
+            for i, ax in enumerate(displayed):
+                slice_pos[ax] = float(cursor[i])
+        elif cursor.size == len(slice_pos):
+            slice_pos = [float(c) for c in cursor]
+        world = np.asarray(slice_pos)
+
+        kind = state["pending_lm_type"]
+        state["pending_lm_type"] = None
+        add_sample_btn.setStyleSheet("")
+        add_ccf_btn.setStyleSheet("")
+        if kind == "sample":
+            M = state["transform"].matrix()
+            M_inv = np.linalg.inv(M)
+            sample_pos = (M_inv[:3, :3] @ world) + M_inv[:3, 3]
+            landmarks_sample_um.append(tuple(map(float, sample_pos)))
+            _refresh_sample_display()
+            i = len(landmarks_sample_um) - 1
+            msg = (f"added SAMPLE landmark #{i}: world={tuple(round(w,1) for w in world)} "
+                   f"→ sample_µm={tuple(round(p,1) for p in sample_pos)}")
+            print(msg, flush=True); viewer.status = msg
+        else:
+            landmarks_ccf_um.append(tuple(map(float, world)))
+            _refresh_ccf_display()
+            i = len(landmarks_ccf_um) - 1
+            msg = f"added CCF landmark #{i}: ccf_µm={tuple(round(w,1) for w in world)}"
+            print(msg, flush=True); viewer.status = msg
+        _refresh_lists()
+
+    # Build the panel
+    lm_panel = QWidget()
+    lm_v = QVBoxLayout(lm_panel)
+    lm_v.setContentsMargins(4, 4, 4, 4)
+
+    btn_row = QHBoxLayout()
+    add_sample_btn = QPushButton("+ SAMPLE landmark\n(next click)")
+    add_ccf_btn = QPushButton("+ CCF landmark\n(next click)")
+    add_sample_btn.clicked.connect(lambda: _add_lm_after_click("sample"))
+    add_ccf_btn.clicked.connect(lambda: _add_lm_after_click("ccf"))
+    btn_row.addWidget(add_sample_btn)
+    btn_row.addWidget(add_ccf_btn)
+    row_wrap = QWidget(); row_wrap.setLayout(btn_row); lm_v.addWidget(row_wrap)
+
+    lists_row = QHBoxLayout()
+    s_box = QGroupBox("sample (µm)")
+    s_box_v = QVBoxLayout(s_box); s_box_v.setContentsMargins(2, 2, 2, 2)
+    sample_list = QListWidget(); sample_list.setMaximumHeight(150)
+    s_box_v.addWidget(sample_list)
+    s_del = QPushButton("Delete selected")
+    s_del.clicked.connect(lambda: (_delete_selected("sample")))
+    s_box_v.addWidget(s_del)
+    lists_row.addWidget(s_box)
+
+    c_box = QGroupBox("CCF (µm)")
+    c_box_v = QVBoxLayout(c_box); c_box_v.setContentsMargins(2, 2, 2, 2)
+    ccf_list = QListWidget(); ccf_list.setMaximumHeight(150)
+    c_box_v.addWidget(ccf_list)
+    c_del = QPushButton("Delete selected")
+    c_del.clicked.connect(lambda: (_delete_selected("ccf")))
+    c_box_v.addWidget(c_del)
+    lists_row.addWidget(c_box)
+    lr_wrap = QWidget(); lr_wrap.setLayout(lists_row); lm_v.addWidget(lr_wrap)
+
+    fit_btn = QPushButton("Fit rigid from landmarks (≥3 pairs)")
+    clear_btn = QPushButton("Clear ALL landmarks")
+    hint = QLabel(
+        "<i>tip: select a row in the list above, click 'Delete selected'. "
+        "Or in the layer-controls toolbar (top-left), pick the points layer "
+        "and press the '−' icon to delete by clicking points on the canvas.</i>"
+    )
+    hint.setWordWrap(True); hint.setStyleSheet("color: #888; padding: 4px;")
+    lm_v.addWidget(fit_btn); lm_v.addWidget(clear_btn); lm_v.addWidget(hint)
+
+    def _delete_selected(which: str):
+        if which == "sample":
+            rows = sorted({i.row() for i in sample_list.selectedIndexes()}, reverse=True)
+            for r in rows:
+                if 0 <= r < len(landmarks_sample_um):
+                    landmarks_sample_um.pop(r)
+            _refresh_sample_display()
+        else:
+            rows = sorted({i.row() for i in ccf_list.selectedIndexes()}, reverse=True)
+            for r in rows:
+                if 0 <= r < len(landmarks_ccf_um):
+                    landmarks_ccf_um.pop(r)
+            _refresh_ccf_display()
+        _refresh_lists()
+
+    def _clear_all():
+        landmarks_sample_um.clear()
+        landmarks_ccf_um.clear()
+        _refresh_sample_display(); _refresh_ccf_display(); _refresh_lists()
+        viewer.status = "all landmarks cleared"
+    clear_btn.clicked.connect(_clear_all)
+
+    def _fit_rigid_from_landmarks():
+        n = min(len(landmarks_sample_um), len(landmarks_ccf_um))
+        if n < 3:
+            msg = (f"need ≥3 pairs (sample={len(landmarks_sample_um)}, "
+                   f"ccf={len(landmarks_ccf_um)})")
+            print(msg, flush=True); viewer.status = msg; return
+        if len(landmarks_sample_um) != len(landmarks_ccf_um):
+            msg = (f"count mismatch: sample={len(landmarks_sample_um)}, "
+                   f"ccf={len(landmarks_ccf_um)} (fitting first {n})")
+            print(msg, flush=True); viewer.status = msg
+
+        sp = np.asarray(landmarks_sample_um[:n])
+        cp = np.asarray(landmarks_ccf_um[:n])
+
+        # Apply current flips to the source side: if flips are on, our actual
+        # transform is R @ F. We want to fit R given F. Pre-apply F to sources.
+        F_diag = np.array([
+            -1.0 if flips["flip_z"] else 1.0,
+            -1.0 if flips["flip_y"] else 1.0,
+            -1.0 if flips["flip_x"] else 1.0,
+        ])
+        c = np.asarray(sample_center_um)
+        sp_F = (sp - c) * F_diag + c
+
+        # Sanity check: landmarks should not be coplanar
+        spread = (sp_F - sp_F.mean(0)).std(0)
+        if spread.min() < 1e-3 * spread.max():
+            msg = (f"WARNING: landmarks are nearly coplanar (spread {spread}). "
+                   f"Add points in the under-constrained axis or the fit will "
+                   f"be ill-conditioned.")
+            print(msg, flush=True); viewer.status = msg
+
+        # Procrustes / Kabsch: R @ sp_F + t ≈ cp
+        src_c = sp_F.mean(axis=0); tgt_c = cp.mean(axis=0)
+        H = (sp_F - src_c).T @ (cp - tgt_c)
+        U, S, Vt = np.linalg.svd(H)
+        d = float(np.sign(np.linalg.det(Vt.T @ U.T)) or 1.0)
+        R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+        t = tgt_c - R @ src_c
+        rms = float(np.sqrt(np.mean(np.sum(((R @ sp_F.T).T + t - cp) ** 2, axis=1))))
+        per_pt = np.sqrt(np.sum(((R @ sp_F.T).T + t - cp) ** 2, axis=1))
+
+        from scipy.spatial.transform import Rotation
+        rz, ry, rx = Rotation.from_matrix(R).as_euler("ZYX", degrees=True)
+
+        state["muted"] = True
+        baseline["rz_deg"] = float(rz)
+        baseline["ry_deg"] = float(ry)
+        baseline["rx_deg"] = float(rx)
+        offset = R @ c - c
+        baseline["tz_um"] = float(t[0] + offset[0])
+        baseline["ty_um"] = float(t[1] + offset[1])
+        baseline["tx_um"] = float(t[2] + offset[2])
+        for nm in ("rz_deg", "ry_deg", "rx_deg", "tz_um", "ty_um", "tx_um"):
+            getattr(controls, nm).value = 0.0
+        state["muted"] = False
+
+        # Build the new transform NOW (not via the slider path) so the prewarp
+        # redraws immediately, not in 200 ms.
+        state["transform"] = RigidTransform(
+            rz_deg=baseline["rz_deg"], ry_deg=baseline["ry_deg"], rx_deg=baseline["rx_deg"],
+            tz_um=baseline["tz_um"],   ty_um=baseline["ty_um"],   tx_um=baseline["tx_um"],
+            flip_z=flips["flip_z"], flip_y=flips["flip_y"], flip_x=flips["flip_x"],
+            center_um=sample_center_um,
+        )
+        _refresh_abs_label()
+        _refresh_prewarp_now()         # immediate, not debounced
+        _refresh_sample_display()
+
+        print(f"\n[zrot.landmark_fit]")
+        print(f"  pairs: {n}    RMS = {rms:.1f} µm")
+        print(f"  flips active: "
+              f"{[a for a, f in zip('zyx', F_diag) if f < 0] or 'none'}")
+        print(f"  rotation:    rz={rz:+7.2f}  ry={ry:+7.2f}  rx={rx:+7.2f} deg")
+        print(f"  translation: tz={baseline['tz_um']:+9.1f}  "
+              f"ty={baseline['ty_um']:+9.1f}  tx={baseline['tx_um']:+9.1f} µm")
+        print(f"  per-pair residuals (µm):")
+        for i, r in enumerate(per_pt):
+            print(f"    pair {i:2d}: {r:7.1f}{'   ← outlier?' if r > 3*rms else ''}")
+        viewer.status = f"fit: {n} pairs, RMS {rms:.0f} µm. See terminal for details."
+    fit_btn.clicked.connect(_fit_rigid_from_landmarks)
+
+    # ---- view-axis switcher (verify in all three orthogonal planes) -----
+    # napari's `dims.order` controls which axis is the slice axis. For data
+    # in (z, y, x), order=(0,1,2) means "scroll z, show y-x plane" = coronal-ish.
+    # Switching axes lets you check whether the alignment holds in every plane.
+    from qtpy.QtWidgets import QPushButton as _QPB
+    view_panel = QWidget()
+    view_layout = QHBoxLayout(view_panel)
+    view_layout.setContentsMargins(2, 2, 2, 2)
+    def _set_view(order):
+        viewer.dims.order = order
+    cor = _QPB("coronal\n(scroll z)")
+    axi = _QPB("axial\n(scroll y)")
+    sag = _QPB("sagittal\n(scroll x)")
+    nd3 = _QPB("3D MIP")
+    cor.clicked.connect(lambda: (_set_view((0, 1, 2)), setattr(viewer.dims, "ndisplay", 2)))
+    axi.clicked.connect(lambda: (_set_view((1, 0, 2)), setattr(viewer.dims, "ndisplay", 2)))
+    sag.clicked.connect(lambda: (_set_view((2, 0, 1)), setattr(viewer.dims, "ndisplay", 2)))
+    nd3.clicked.connect(lambda: setattr(viewer.dims, "ndisplay", 3))
+    for b in (cor, axi, sag, nd3):
+        view_layout.addWidget(b)
+
+    # All controls live in a single TabWidget on the right so the napari
+    # canvas + bottom z-slider stay visible at any screen size.
+    from qtpy.QtWidgets import QTabWidget
+    tabs = QTabWidget()
+
+    actions_widget = QWidget()
+    actions_layout = QVBoxLayout(actions_widget)
+    actions_layout.setContentsMargins(4, 4, 4, 4)
+    for w in (save_btn, commit_btn, reset_btn):
+        actions_layout.addWidget(w.native if hasattr(w, "native") else w)
+    actions_layout.addStretch(1)
+
+    def _q(w):
+        # magicgui Container/Widget → underlying QWidget
+        return w.native if hasattr(w, "native") else w
+
+    tabs.addTab(_q(controls_widget), "Δ sliders")
+    tabs.addTab(_q(jog),              "jog")
+    tabs.addTab(_q(view_panel),       "view")
+    tabs.addTab(_q(lm_panel),         "landmarks")
+    tabs.addTab(_q(actions_widget),   "save/commit/reset")
+
+    # `pose` stays out of the tabs — it's always-visible info above them.
+    right_root = QWidget()
+    right_v = QVBoxLayout(right_root)
+    right_v.setContentsMargins(2, 2, 2, 2)
+    right_v.addWidget(abs_label.native if hasattr(abs_label, "native") else abs_label)
+    right_v.addWidget(tabs, 1)
+    viewer.window.add_dock_widget(right_root, name="zrot", area="right")
     _refresh_abs_label()
 
     print("[zrot] keyboard: Arrows = nudge tx/ty, PgUp/PgDn = tz, q/e = rz "

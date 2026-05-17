@@ -21,6 +21,8 @@ transform.json
 transform_*.json
 identity.json
 *.transform.json
+state.json
+state_*.json
 
 # Output directories
 out/
