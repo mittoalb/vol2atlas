@@ -1,8 +1,8 @@
 """Compare several method outputs in one napari viewer.
 
 Pass any number of directories that each contain a
-`sample_in_ccf.nii.gz` (as produced by `zrot export`, `zrot ants`,
-`zrot brainreg`). The first dir's `atlas_cropped.nii.gz` is used as
+`sample_in_ccf.nii.gz` (as produced by `vol2atlas export`, `vol2atlas ants`,
+`vol2atlas brainreg`). The first dir's `atlas_cropped.nii.gz` is used as
 the gray reference; each sample is added as its own toggleable layer.
 
 Usage:
@@ -28,7 +28,7 @@ voxel_um   = tuple(nib.load(str(atlas_path)).header.get_zooms()[:3])
 voxel_um   = tuple(float(v) * 1000.0 for v in voxel_um)  # mm → µm
 print(f"atlas       {atlas.shape}  voxel {voxel_um} µm  (from {dirs[0].name})")
 
-v = napari.Viewer(ndisplay=2, title="zrot — method comparison")
+v = napari.Viewer(ndisplay=2, title="vol2atlas — method comparison")
 v.add_image(atlas, name="ATLAS", scale=voxel_um,
             colormap="gray", blending="additive", opacity=0.5)
 

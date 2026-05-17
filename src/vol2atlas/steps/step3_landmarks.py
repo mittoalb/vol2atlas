@@ -24,7 +24,7 @@ def run(state_path: Path) -> None:
     from ..state import load
     state = load(state_path)
     if state.transform is None:
-        raise RuntimeError("state.json has no transform — run `zrot step1` first.")
+        raise RuntimeError("state.json has no transform — run `vol2atlas prealign` first.")
     _run_napari(state, state_path)
 
 
@@ -99,7 +99,7 @@ def _run_napari(state, state_path: Path) -> None:
         a_lo, a_hi = np.percentile(f, [lo, hi])
         return float(a_lo), float(max(a_hi, a_lo + 1))
 
-    viewer = napari.Viewer(ndisplay=2, title="zrot step3 — landmarks")
+    viewer = napari.Viewer(ndisplay=2, title="vol2atlas landmarks — landmarks")
     viewer.add_image(ccf_data, name="CCF", scale=ccf.voxel_um, translate=ccf_origin,
                      colormap="gray", contrast_limits=_percentiles(ccf_data),
                      opacity=0.5, blending="additive",
@@ -319,7 +319,7 @@ def _run_napari(state, state_path: Path) -> None:
             "sample_um": [list(p) for p in landmarks_sample],
             "ccf_um":    [list(p) for p in landmarks_ccf],
         }
-        state.add_history("step3",
+        state.add_history("landmarks",
                           f"{len(landmarks_sample)} sample, {len(landmarks_ccf)} CCF landmarks")
         save_state(state, state_path)
         print(f"[step3] saved -> {state_path}", flush=True)
@@ -327,7 +327,7 @@ def _run_napari(state, state_path: Path) -> None:
     save_btn.clicked.connect(_save_and_exit)
     ctrl_v.addWidget(save_btn)
 
-    dock = viewer.window.add_dock_widget(ctrl, name="step3", area="right")
+    dock = viewer.window.add_dock_widget(ctrl, name="landmarks", area="right")
     try:
         dock.setMinimumWidth(280); dock.setMaximumWidth(900)
     except Exception:

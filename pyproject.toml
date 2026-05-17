@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "zrot"
+name = "vol2atlas"
 version = "0.1.0"
 description = "Interactive rigid alignment of large OME-Zarr volumes to the Allen CCF"
 requires-python = ">=3.10"
@@ -11,6 +11,7 @@ dependencies = [
     "zarr>=2.16,<3",
     "ome-zarr>=0.9",
     "dask[array]>=2024.1",
+    "dask-image>=2024.1",
     "numpy>=1.24",
     "scipy>=1.11",
     "napari[all]>=0.4.19",
@@ -19,10 +20,19 @@ dependencies = [
     "typer>=0.12",
     "nibabel>=5.0",
     "tifffile>=2024.1",  # reading brainreg's downsampled_standard.tiff
+    "tqdm>=4.66",
 ]
 
+[project.optional-dependencies]
+ants     = ["antspyx>=0.4"]
+elastix  = ["itk-elastix>=0.21"]
+brainreg = ["brainreg>=1.0"]
+slides   = ["python-pptx>=1.0"]
+full     = ["antspyx>=0.4", "itk-elastix>=0.21", "brainreg>=1.0",
+            "python-pptx>=1.0"]
+
 [project.scripts]
-zrot = "zrot.cli:app"
+vol2atlas = "vol2atlas.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]

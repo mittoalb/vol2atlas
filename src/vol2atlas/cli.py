@@ -1,4 +1,4 @@
-"""Step-based CLI for the zrot → brainreg workflow."""
+"""Step-based CLI for the vol2atlas → brainreg workflow."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -54,32 +54,32 @@ def init(
     save_state(s, state)
     typer.echo(f"wrote {state}")
     typer.echo(ms.summary())
-    typer.echo(f"\nNext: zrot step1 {state}")
+    typer.echo(f"\nNext: vol2atlas prealign {state}")
 
 
 @app.command()
-def step1(
+def prealign(
     state: Path = typer.Argument(Path("state.json"), help="State file."),
 ):
-    """Step 1: 3D rough prealign (sliders, flips, jog) + CCF crop ROI."""
+    """3D rough prealign (translation/rotation sliders, axis flips) + CCF crop ROI."""
     from .steps.step1_prealign import run
     run(state)
 
 
 @app.command()
-def step2(
+def refine(
     state: Path = typer.Argument(Path("state.json"), help="State file."),
 ):
-    """Step 2: fine refinement in 3 simultaneous orthogonal views."""
+    """Fine refinement in axial / coronal / sagittal views with tight slider ranges."""
     from .steps.step2_refine import run
     run(state)
 
 
 @app.command()
-def step3(
+def landmarks(
     state: Path = typer.Argument(Path("state.json"), help="State file."),
 ):
-    """Step 3: landmark-based rigid fit (Procrustes)."""
+    """Pick landmark pairs on sample + CCF; optional Procrustes rigid fit."""
     from .steps.step3_landmarks import run
     run(state)
 
@@ -93,7 +93,7 @@ def export(
     tps: bool = typer.Option(
         False, "--tps",
         help="Add a thin-plate-spline correction ON TOP of the rigid "
-             "transform (needs ≥4 landmark pairs from step3). Far from "
+             "transform (needs ≥4 landmark pairs from `landmarks`). Far from "
              "landmarks the correction vanishes and the rigid result is "
              "preserved."),
     tps_smoothing: float = typer.Option(
@@ -104,9 +104,9 @@ def export(
     skip_view: bool = typer.Option(False, "--skip-view"),
 ):
     """Export sample+atlas to NIfTI and multiscale OME-Zarr through the
-    SAME code path as step3's working display. No brainreg, no ANTs, no
+    SAME code path as the WYSIWYG resample from `landmarks`. No brainreg, no ANTs, no
     orientation tricks — symmetric save/load so atlas and sample overlay
-    the same way you saw in step3."""
+    the same way you saw in `landmarks`."""
     from .steps.step_export import run
     run(state, out_dir, level=level, tps=tps,
         tps_smoothing=tps_smoothing, skip_view=skip_view)
@@ -115,7 +115,7 @@ def export(
 @app.command()
 def ants(
     export_dir: Path = typer.Argument(...,
-        help="Output dir of a previous `zrot export` run."),
+        help="Output dir of a previous `vol2atlas export` run."),
     out_dir: Path = typer.Option(Path("out/ants"), "--out", "-o"),
     transform_type: str = typer.Option(
         "SyNOnly", "--transform",
@@ -131,7 +131,7 @@ def ants(
                                  help="State file to log this run into."),
     skip_view:     bool = typer.Option(False, "--skip-view"),
 ):
-    """Refine a `zrot export` output with ANTs SyNOnly + brain masks."""
+    """Refine a `vol2atlas export` output with ANTs SyNOnly + brain masks."""
     from .steps.refine_ants import run
     run(export_dir, out_dir,
         transform_type=transform_type,
@@ -143,7 +143,7 @@ def ants(
 @app.command()
 def brainreg(
     export_dir: Path = typer.Argument(...,
-        help="Output dir of a previous `zrot export` run."),
+        help="Output dir of a previous `vol2atlas export` run."),
     out_dir: Path = typer.Option(Path("out/brainreg"), "--out", "-o"),
     atlas: str   = typer.Option("allen_mouse_25um", "--atlas"),
     orientation: str = typer.Option(
@@ -158,13 +158,88 @@ def brainreg(
     state: Path  = typer.Option(Path("state.json"), "--state", "-s"),
     skip_view: bool = typer.Option(False, "--skip-view"),
 ):
-    """Refine a `zrot export` output with BrainGlobe brainreg.
+    """Refine a `vol2atlas export` output with BrainGlobe brainreg.
 
     NOTE: brainreg assumes a full brain or a complete hemisphere; on a
     partial sample it will distort to fill the missing region."""
     from .steps.refine_brainreg import run
     run(export_dir, out_dir, atlas_name=atlas, orientation=orientation,
         brain_geometry=brain_geometry, state_path=state, skip_view=skip_view)
+
+
+@app.command()
+def elastix(
+    export_dir: Path = typer.Argument(...,
+        help="Output dir of a previous `vol2atlas export` run."),
+    out_dir: Path = typer.Option(Path("out/elastix"), "--out", "-o"),
+    grid_voxels: int = typer.Option(
+        16, "--grid",
+        help="B-spline grid spacing in voxels (Humbel et al. used 16)."),
+    bending_energy: float = typer.Option(
+        1000.0, "--bending",
+        help="Bending-energy penalty weight (Humbel et al. used 1000). "
+             "Higher = smoother (more rigid-like) warp."),
+    iterations: int = typer.Option(1000, "--iter"),
+    resolutions: int = typer.Option(
+        4, "--resolutions",
+        help="Number of multi-resolution pyramid levels."),
+    metric: str = typer.Option(
+        "AdvancedMattesMutualInformation", "--metric",
+        help="elastix image similarity metric. MI is right for cross-modality "
+             "(µCT vs LSFM/Nissl atlas); switch to "
+             "AdvancedNormalizedCorrelation only for same-modality."),
+    no_masks: bool = typer.Option(False, "--no-masks",
+        help="Disable Otsu brain masks (default: masks ON)."),
+    state: Path = typer.Option(Path("state.json"), "--state", "-s"),
+    skip_view: bool = typer.Option(False, "--skip-view"),
+):
+    """Refine a `vol2atlas export` output with elastix B-spline FFD.
+
+    Defaults match Humbel et al. 2024 (µCT mouse brain → CCF):
+    grid 16 voxels, bending-energy 1000, 4-level pyramid, MI metric."""
+    from .steps.refine_elastix import run
+    run(export_dir, out_dir,
+        grid_voxels=grid_voxels, bending_energy=bending_energy,
+        iterations=iterations, resolutions=resolutions, metric=metric,
+        use_masks=not no_masks,
+        state_path=state, skip_view=skip_view)
+
+
+@app.command("alignFull")
+def align_full(
+    state: Path = typer.Argument(Path("state.json"), help="State file."),
+    out: Path = typer.Option(
+        Path("out/full_in_ccf.zarr"), "--out", "-o",
+        help="Output multiscale OME-Zarr (overwritten)."),
+    levels: Optional[str] = typer.Option(
+        None, "--levels",
+        help="Comma-separated input pyramid levels to warp "
+             "(e.g. '1,2,3'). Default: all available levels of the input "
+             "zarr. Note level 0 of a typical µCT zarr is ~TB; consider "
+             "starting from level 1 or 2."),
+    chunks: Optional[str] = typer.Option(
+        None, "--chunks",
+        help="Output zarr chunk size as z,y,x. Default: mirror the input "
+             "zarr's chunks at each level (aligns reads = much faster)."),
+):
+    """Apply state.json's rigid transform to the FULL OME-Zarr chunkwise.
+
+    For each requested input pyramid level, lazily reads sample's level k,
+    applies the inverse rigid via dask_image.ndinterp.affine_transform,
+    writes the warped result as level k of a new multiscale OME-Zarr in
+    CCF coordinates. RAM stays bounded by chunk size — does NOT load any
+    level fully.
+
+    Currently rigid-only. ANTs/elastix deformable composition: TODO."""
+    from .steps.align_full import run
+    lvls = [int(x) for x in levels.split(",")] if levels else None
+    chk: Optional[tuple[int, int, int]] = None
+    if chunks:
+        parts = tuple(int(x) for x in chunks.split(","))
+        if len(parts) != 3:
+            raise typer.BadParameter("--chunks needs 3 ints, e.g. 64,64,64")
+        chk = parts
+    run(state, out, levels=lvls, output_chunks=chk)
 
 
 @app.command()

@@ -1,13 +1,13 @@
 """Export: writes the warped sample + cropped atlas as NIfTI and
-multiscale OME-Zarr, using the same resample code path that step3 uses
+multiscale OME-Zarr, using the same resample code path that the `landmarks` step uses
 for its WYSIWYG napari display.
 
 Both the sample and the atlas go through one shared writer with one
 identical diagonal affine `diag([z_um, y_um, x_um, 1])`, so any reader
 either gets both axis-flipped or neither — the overlay you see in the
-QC viewer matches what step3 showed.
+QC viewer matches what `landmarks` showed.
 
-With `--tps` and ≥4 landmark pairs from step3, a thin-plate spline is
+With `--tps` and ≥4 landmark pairs from `landmarks`, a thin-plate spline is
 fit to the *residuals* between the rigid prediction and your landmark
 clicks (not to the absolute targets). Far from landmarks the correction
 vanishes and the rigid result is preserved; at landmarks the sample
@@ -42,13 +42,13 @@ def run(
 
     state = load(state_path)
     if state.transform is None:
-        raise RuntimeError("state.json has no transform — run step1 first.")
+        raise RuntimeError("state.json has no transform — run `vol2atlas prealign` first.")
 
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     used_level = level if level is not None else state.sample_level
     print(f"\n[export] level={used_level}  atlas={state.atlas_name}  tps={tps}")
 
-    # ---------- sample (same loader as step3) -------------------------------
+    # ---------- sample (same loader as `landmarks`) -------------------------------
     ms = open_multiscale(state.sample_zarr)
     arr = ms.level(used_level)
     if "c" in ms.axes:
@@ -73,7 +73,7 @@ def run(
     print(f"[export] loading {arr.shape} into RAM...", flush=True)
     sample_np = np.ascontiguousarray(arr.compute())
 
-    # ---------- atlas with crop (same as step3) -----------------------------
+    # ---------- atlas with crop (same as `landmarks`) -----------------------------
     ccf_ref_full = np.asarray(ccf.reference)
     b = state.ccf_crop_bbox
     if b is None:
@@ -85,7 +85,7 @@ def run(
         crop_voxel_origin = np.array([z0, y0, x0], dtype=float)
     print(f"[export] CCF grid: {ccf_data.shape} @ {ccf.voxel_um} µm")
 
-    # ---------- rigid transform (same as step3) -----------------------------
+    # ---------- rigid transform (same as `landmarks`) -----------------------------
     rigid = RigidTransform(
         **{k: state.transform[k] for k in
            ["rz_deg", "ry_deg", "rx_deg", "tz_um", "ty_um", "tx_um"]},
@@ -95,7 +95,7 @@ def run(
         center_um=tuple(state.transform.get("center_um", (0.0, 0.0, 0.0))),
     )
 
-    # ---------- resample: COPY of step3._resample(), order=1 for export ----
+    # ---------- resample: COPY of the `landmarks` _resample(), order=1 for export ----
     M = rigid.for_voxel_grid(sample_um, ccf.voxel_um)
     Minv = np.linalg.inv(M)
     offset = Minv[:3, :3] @ crop_voxel_origin + Minv[:3, 3]
@@ -227,7 +227,7 @@ def _save_ngff(arr: np.ndarray, zarr_out: Path,
 
 
 def _qc_view(sample_path: Path, atlas_path: Path, voxel_um) -> None:
-    """QC viewer that EXACTLY mirrors step3's display pattern.
+    """QC viewer that EXACTLY mirrors the `landmarks` display pattern.
 
     Both layers come through `nib.load(...).dataobj` (preserves on-disk
     axis order) and both are shown with `scale=voxel_um`. Symmetric in
@@ -237,7 +237,7 @@ def _qc_view(sample_path: Path, atlas_path: Path, voxel_um) -> None:
     sample = np.asarray(nib.load(str(sample_path)).dataobj)
     atlas  = np.asarray(nib.load(str(atlas_path)).dataobj)
     print(f"\n[export] QC: atlas {atlas.shape}  sample {sample.shape}")
-    v = napari.Viewer(ndisplay=2, title="zrot export — QC")
+    v = napari.Viewer(ndisplay=2, title="vol2atlas export — QC")
     v.add_image(atlas, name="ATLAS (cropped)", scale=voxel_um,
                 colormap="gray", blending="additive", opacity=0.5)
     v.add_image(sample, name="SAMPLE (warped)", scale=voxel_um,

@@ -110,7 +110,7 @@ def _run_napari(state: State, state_path: Path) -> None:
     _apply_crop()
 
     # -------- napari viewer --------------------------------------------
-    viewer = napari.Viewer(ndisplay=3, title="zrot step1: prealign + crop")
+    viewer = napari.Viewer(ndisplay=3, title="vol2atlas prealign: prealign + crop")
 
     ccf_layer = viewer.add_image(
         box["ccf_data"], name="CCF",
@@ -299,7 +299,7 @@ def _run_napari(state: State, state_path: Path) -> None:
     save_btn = QPushButton("Save state.json && exit")
     def _save():
         state.transform = box["transform"].to_dict()
-        state.add_history("step1", f"crop={state.ccf_crop_bbox}")
+        state.add_history("prealign", f"crop={state.ccf_crop_bbox}")
         save_state(state, state_path)
         print(f"[step1] saved -> {state_path}", flush=True)
         viewer.status = f"saved {state_path}"
@@ -316,7 +316,7 @@ def _run_napari(state: State, state_path: Path) -> None:
     # Let the dock shrink — important on small monitors.
     tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
     tabs.setMinimumWidth(0)
-    dock = viewer.window.add_dock_widget(tabs, name="step1", area="right")
+    dock = viewer.window.add_dock_widget(tabs, name="prealign", area="right")
     try:
         dock.setMinimumWidth(220)   # absolute floor
         dock.setMaximumWidth(900)   # cap so it doesn't auto-grow huge

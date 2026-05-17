@@ -22,7 +22,7 @@ def run(state_path: Path) -> None:
     from ..state import load
     state = load(state_path)
     if state.transform is None:
-        raise RuntimeError("state.json has no transform — run `zrot step1` first.")
+        raise RuntimeError("state.json has no transform — run `vol2atlas prealign` first.")
     _run_napari(state, state_path)
 
 
@@ -108,7 +108,7 @@ def _run_napari(state, state_path: Path) -> None:
     ccf_clim    = _percentiles(ccf_data)
     sample_clim = _percentiles(sample_np)
 
-    viewer = napari.Viewer(ndisplay=2, title="zrot step2 — refine")
+    viewer = napari.Viewer(ndisplay=2, title="vol2atlas refine — refine")
     viewer.add_image(ccf_data, name="CCF", scale=ccf.voxel_um, translate=ccf_origin,
                      colormap="gray", contrast_limits=ccf_clim, opacity=0.5,
                      blending="additive",
@@ -223,14 +223,14 @@ def _run_napari(state, state_path: Path) -> None:
     def _save_and_exit():
         box["transform"].center_um = box["center_um"]
         state.transform = box["transform"].to_dict()
-        state.add_history("step2", "fine refine, single viewer with ortho swap")
+        state.add_history("refine", "fine refine, single viewer with ortho swap")
         save_state(state, state_path)
         print(f"[step2] saved -> {state_path}", flush=True)
         viewer.close()
     save_btn.clicked.connect(_save_and_exit)
     ctrl_v.addWidget(save_btn)
 
-    dock = viewer.window.add_dock_widget(ctrl, name="step2", area="right")
+    dock = viewer.window.add_dock_widget(ctrl, name="refine", area="right")
     try:
         dock.setMinimumWidth(240); dock.setMaximumWidth(900)
     except Exception:

@@ -45,7 +45,7 @@ def run(
     sample_in  = export_dir / "sample_in_ccf.nii.gz"
     atlas_in   = export_dir / "atlas_cropped.nii.gz"
     if not sample_in.exists() or not atlas_in.exists():
-        sys.exit(f"[ants] missing inputs in {export_dir} — run `zrot export` first.")
+        sys.exit(f"[ants] missing inputs in {export_dir} — run `vol2atlas export` first.")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     fixed       = ants.image_read(str(atlas_in))
@@ -132,7 +132,7 @@ def _qc(sample_path: Path, atlas_path: Path, voxel_um) -> None:
     import napari
     sample = np.asarray(nib.load(str(sample_path)).dataobj)
     atlas  = np.asarray(nib.load(str(atlas_path)).dataobj)
-    v = napari.Viewer(ndisplay=2, title="zrot ANTs — QC")
+    v = napari.Viewer(ndisplay=2, title="vol2atlas ANTs — QC")
     v.add_image(atlas,  name="ATLAS",   scale=voxel_um,
                 colormap="gray",    blending="additive", opacity=0.5)
     v.add_image(sample, name="ANTs warped", scale=voxel_um,
