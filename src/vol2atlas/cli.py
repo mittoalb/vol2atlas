@@ -253,5 +253,19 @@ def info(zarr_path: Path = typer.Argument(...)):
     typer.echo(ms.summary())
 
 
+@app.command("help-all")
+def help_all():
+    """Show full --help (args, options, defaults) for every subcommand."""
+    import click
+    group = typer.main.get_command(app)
+    for name, cmd in group.commands.items():
+        if name == "help-all":
+            continue
+        sub_ctx = click.Context(cmd, info_name=f"vol2atlas {name}")
+        typer.echo("=" * 72)
+        typer.echo(cmd.get_help(sub_ctx))
+        typer.echo("")
+
+
 if __name__ == "__main__":
     app()
