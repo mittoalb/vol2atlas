@@ -58,6 +58,34 @@ Full help for every subcommand (args, options, defaults):
 vol2atlas help-all
 ```
 
+## EM (Stage B) — align to your own µCT, not to CCF
+
+Same CLI. Stage A's `alignFull` output becomes Stage B's reference.
+
+```bash
+# Stage A — µCT to CCF (as above)
+vol2atlas init      sample_uct.zarr -s state_uct.json --voxel-um 2.74
+vol2atlas prealign  state_uct.json
+vol2atlas refine    state_uct.json
+vol2atlas landmarks state_uct.json
+vol2atlas alignFull state_uct.json -o out/uct_in_ccf.zarr
+
+# Stage B — EM to that aligned µCT
+vol2atlas init      sample_em.zarr -s state_em.json \
+                    --reference out/uct_in_ccf.zarr --voxel-um 0.004
+vol2atlas prealign  state_em.json
+vol2atlas refine    state_em.json
+vol2atlas landmarks state_em.json
+vol2atlas alignFull state_em.json --tps -o out/em_in_ccf.zarr
+```
+
+EM (nm voxels, TB scale) goes through the same chunkwise warp — RAM
+stays bounded by chunk size, not by volume size. See
+[vol2atlas_strategy.pptx](vol2atlas_strategy.pptx) for the architecture.
+
+> The `--reference` and `--tps` flags on `init`/`alignFull` are the
+> 4-step roadmap inside the strategy deck — not yet on `main`.
+
 ## QC
 
 ```bash
