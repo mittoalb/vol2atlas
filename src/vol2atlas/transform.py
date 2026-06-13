@@ -26,18 +26,14 @@ class RigidTransform:
     tz_um: float = 0.0
     ty_um: float = 0.0
     tx_um: float = 0.0
-    # Axis flips (mirror about `center_um`) — applied BEFORE rotation.
-    flip_z: bool = False
-    flip_y: bool = False
-    flip_x: bool = False
-    # Center of rotation/flip (µm), in SAMPLE physical space — typically volume center
+    # Center of rotation (µm), in SAMPLE physical space — typically volume center
     center_um: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def matrix(self) -> np.ndarray:
         """Return a 4x4 homogeneous matrix mapping sample µm -> CCF µm.
 
-        Order:  T_translate * T_to_origin_inv * R * F * T_to_origin
-        i.e. flip about `center_um`, then rotate, then translate.
+        Order:  T_translate * T_to_origin_inv * R * T_to_origin
+        i.e. rotate about `center_um`, then translate.
         """
         c = np.asarray(self.center_um, dtype=float)
         R = Rotation.from_euler(
@@ -45,15 +41,9 @@ class RigidTransform:
             [self.rz_deg, self.ry_deg, self.rx_deg],
             degrees=True,
         ).as_matrix()
-        F = np.diag([
-            -1.0 if self.flip_z else 1.0,
-            -1.0 if self.flip_y else 1.0,
-            -1.0 if self.flip_x else 1.0,
-        ])
-        RF = R @ F
         M = np.eye(4)
-        M[:3, :3] = RF
-        M[:3, 3] = -RF @ c + c + np.array([self.tz_um, self.ty_um, self.tx_um])
+        M[:3, :3] = R
+        M[:3, 3] = -R @ c + c + np.array([self.tz_um, self.ty_um, self.tx_um])
         return M
 
     def inverse_matrix(self) -> np.ndarray:
@@ -93,9 +83,6 @@ class RigidTransform:
             "tz_um": self.tz_um,
             "ty_um": self.ty_um,
             "tx_um": self.tx_um,
-            "flip_z": bool(self.flip_z),
-            "flip_y": bool(self.flip_y),
-            "flip_x": bool(self.flip_x),
             "center_um": list(self.center_um),
             "matrix_4x4": self.matrix().tolist(),
         }
@@ -105,9 +92,6 @@ class RigidTransform:
         return cls(
             rz_deg=d["rz_deg"], ry_deg=d["ry_deg"], rx_deg=d["rx_deg"],
             tz_um=d["tz_um"], ty_um=d["ty_um"], tx_um=d["tx_um"],
-            flip_z=bool(d.get("flip_z", False)),
-            flip_y=bool(d.get("flip_y", False)),
-            flip_x=bool(d.get("flip_x", False)),
             center_um=tuple(d["center_um"]),
         )
 

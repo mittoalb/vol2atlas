@@ -24,6 +24,7 @@ import nibabel as nib
 import numpy as np
 
 from ..atlas import load_ccf
+from ..frame import compute_output_frame, extract_ccf
 from ..io import open_multiscale
 from ..state import save as save_state
 from ..transform import RigidTransform
@@ -73,7 +74,7 @@ def run(
     print(f"[export] loading {arr.shape} into RAM...", flush=True)
     sample_np = np.ascontiguousarray(arr.compute())
 
-    # ---------- atlas with crop (same as `landmarks`) -----------------------------
+    # ---------- atlas crop (= user's bbox, no union) ------------------
     ccf_ref_full = np.asarray(ccf.reference)
     b = state.ccf_crop_bbox
     if b is None:
@@ -83,23 +84,30 @@ def run(
         z0, z1 = b["z"]; y0, y1 = b["y"]; x0, x1 = b["x"]
         ccf_data = ccf_ref_full[z0:z1, y0:y1, x0:x1]
         crop_voxel_origin = np.array([z0, y0, x0], dtype=float)
-    print(f"[export] CCF grid: {ccf_data.shape} @ {ccf.voxel_um} µm")
+    print(f"[export] CCF crop: shape={ccf_data.shape}  "
+          f"origin(vox)={tuple(int(v) for v in crop_voxel_origin)}  @ {ccf.voxel_um} µm")
 
-    # ---------- rigid transform (same as `landmarks`) -----------------------------
     rigid = RigidTransform(
         **{k: state.transform[k] for k in
            ["rz_deg", "ry_deg", "rx_deg", "tz_um", "ty_um", "tx_um"]},
-        flip_z=bool(state.transform.get("flip_z", False)),
-        flip_y=bool(state.transform.get("flip_y", False)),
-        flip_x=bool(state.transform.get("flip_x", False)),
         center_um=tuple(state.transform.get("center_um", (0.0, 0.0, 0.0))),
     )
 
-    # ---------- resample: COPY of the `landmarks` _resample(), order=1 for export ----
-    M = rigid.for_voxel_grid(sample_um, ccf.voxel_um)
+    # ---------- compose rigid + (optional) affine refinement -----------
+    # Combined µm transform: sample_µm  --rigid-->  CCF_µm  --affine-->  CCF_µm
+    M_um = rigid.matrix()
+    if state.affine is not None:
+        A_um = np.asarray(state.affine, dtype=float)
+        M_um = A_um @ M_um
+        print(f"[export] composing state.affine on top of rigid")
+    # Convert combined µm transform to voxel space.
+    S_in_smp  = np.diag([sample_um[0], sample_um[1], sample_um[2], 1.0])
+    S_out_ccf = np.diag([1.0 / ccf.voxel_um[0], 1.0 / ccf.voxel_um[1],
+                          1.0 / ccf.voxel_um[2], 1.0])
+    M = S_out_ccf @ M_um @ S_in_smp
     Minv = np.linalg.inv(M)
     offset = Minv[:3, :3] @ crop_voxel_origin + Minv[:3, 3]
-    print(f"[export] rigid resample → {ccf_data.shape}...", flush=True)
+    print(f"[export] resample → {ccf_data.shape}...", flush=True)
     warped = affine_transform(
         sample_np, Minv[:3, :3], offset=offset,
         output_shape=ccf_data.shape, order=1, mode="constant", cval=0,
@@ -124,16 +132,22 @@ def run(
             sample_lms = np.asarray(sample_lms_raw[:n_pairs], dtype=float)
             ccf_lms    = np.asarray(ccf_lms_raw   [:n_pairs], dtype=float)
 
-            # Rigid's prediction of "what sample µm point corresponds to
-            # this CCF µm point": sample_pred = Minv_um @ ccf_µm.
-            M_um = rigid.matrix()
-            Minv_um = np.linalg.inv(M_um)
+            # Baseline prediction = COMBINED transform (rigid + affine).
+            # TPS is fit on the residuals between this baseline and
+            # the actual landmark clicks. So if state.affine was set
+            # (e.g., by "Fit AFFINE" in landmarks), TPS layers on top
+            # of the affine; otherwise on top of rigid alone.
+            M_um_base = rigid.matrix()
+            if state.affine is not None:
+                M_um_base = np.asarray(state.affine, dtype=float) @ M_um_base
+            Minv_um = np.linalg.inv(M_um_base)
             ccf_h = np.hstack([ccf_lms, np.ones((n_pairs, 1))])
-            rigid_pred_sample = (Minv_um @ ccf_h.T).T[:, :3]
-            residuals = sample_lms - rigid_pred_sample
+            baseline_pred_sample = (Minv_um @ ccf_h.T).T[:, :3]
+            residuals = sample_lms - baseline_pred_sample
             res_mag = np.linalg.norm(residuals, axis=1)
-            print(f"[export] TPS-on-residuals  n={n_pairs}  "
-                  f"smoothing={tps_smoothing}")
+            base_name = "affine" if state.affine is not None else "rigid"
+            print(f"[export] TPS-on-residuals (baseline={base_name})  "
+                  f"n={n_pairs}  smoothing={tps_smoothing}")
             print(f"[export] per-landmark residual µm: "
                   f"min={res_mag.min():.1f}  mean={res_mag.mean():.1f}  "
                   f"max={res_mag.max():.1f}")
@@ -175,8 +189,20 @@ def run(
             ).reshape(ccf_data.shape).astype(sample_np.dtype)
             del sample_vox_grid
 
+    # ---------- sample presence mask ---------------------------------------
+    # Warp a ones-array through the same rigid transform to get a binary
+    # "where the sample exists in CCF space" mask. Lets the QC viewer and
+    # downstream tools tell the sample's zero-background apart from the
+    # CCF's zero-background.
+    print("[export] computing sample presence mask...", flush=True)
+    mask_in = np.ones(sample_np.shape, dtype=np.uint8)
+    sample_mask = affine_transform(
+        mask_in, Minv[:3, :3], offset=offset,
+        output_shape=ccf_data.shape, order=0, mode="constant", cval=0,
+    ).astype(np.uint8)
+
     # ---------- write outputs through ONE shared writer --------------------
-    # PLAIN DIAGONAL AFFINE — no brainglobe-orientation games. Both files
+    # PLAIN DIAGONAL AFFINE — no brainglobe-orientation games. All files
     # use the same affine, so any reader either gets both axis-flipped or
     # neither, and they overlay correctly.
     vox = np.asarray(ccf.voxel_um, dtype=float) * 1e-3   # µm → mm
@@ -184,15 +210,19 @@ def run(
 
     sample_nii = out_dir / "sample_in_ccf.nii.gz"
     atlas_nii  = out_dir / "atlas_cropped.nii.gz"
+    mask_nii   = out_dir / "sample_mask.nii.gz"
     _save_nifti(warped, diag_affine, sample_nii)
     _save_nifti(ccf_data, diag_affine, atlas_nii)
-    print(f"[export] wrote {sample_nii.name} + {atlas_nii.name}")
+    _save_nifti(sample_mask, diag_affine, mask_nii)
+    print(f"[export] wrote {sample_nii.name} + {atlas_nii.name} + {mask_nii.name}")
 
     sample_zarr = out_dir / "sample_in_ccf.zarr"
     atlas_zarr  = out_dir / "atlas_cropped.zarr"
-    _save_ngff(warped,   sample_zarr, ccf.voxel_um)
-    _save_ngff(ccf_data, atlas_zarr,  ccf.voxel_um)
-    print(f"[export] wrote {sample_zarr.name} + {atlas_zarr.name}")
+    mask_zarr   = out_dir / "sample_mask.zarr"
+    _save_ngff(warped,      sample_zarr, ccf.voxel_um)
+    _save_ngff(ccf_data,    atlas_zarr,  ccf.voxel_um)
+    _save_ngff(sample_mask, mask_zarr,   ccf.voxel_um)
+    print(f"[export] wrote {sample_zarr.name} + {atlas_zarr.name} + {mask_zarr.name}")
 
     state.add_history(
         "export",
@@ -201,7 +231,7 @@ def run(
 
     if skip_view:
         return
-    _qc_view(sample_nii, atlas_nii, ccf.voxel_um)
+    _qc_view(sample_nii, atlas_nii, mask_nii, ccf.voxel_um)
 
 
 def _save_nifti(arr: np.ndarray, affine: np.ndarray, path: Path) -> None:
@@ -226,20 +256,22 @@ def _save_ngff(arr: np.ndarray, zarr_out: Path,
     )
 
 
-def _qc_view(sample_path: Path, atlas_path: Path, voxel_um) -> None:
-    """QC viewer that EXACTLY mirrors the `landmarks` display pattern.
-
-    Both layers come through `nib.load(...).dataobj` (preserves on-disk
-    axis order) and both are shown with `scale=voxel_um`. Symmetric in
-    every way that matters for overlay correctness.
+def _qc_view(sample_path: Path, atlas_path: Path, mask_path: Path,
+              voxel_um) -> None:
+    """QC viewer. Uses the sample_mask to set out-of-sample voxels to
+    NaN so napari renders them transparent — the sample background no
+    longer washes over the CCF.
     """
     import napari
-    sample = np.asarray(nib.load(str(sample_path)).dataobj)
+    sample = np.asarray(nib.load(str(sample_path)).dataobj).astype(np.float32)
     atlas  = np.asarray(nib.load(str(atlas_path)).dataobj)
-    print(f"\n[export] QC: atlas {atlas.shape}  sample {sample.shape}")
+    mask   = np.asarray(nib.load(str(mask_path )).dataobj).astype(bool)
+    sample[~mask] = np.nan
+    print(f"\n[export] QC: atlas {atlas.shape}  sample {sample.shape}  "
+          f"(mask {mask.sum()/mask.size*100:.1f}% covered)")
     v = napari.Viewer(ndisplay=2, title="vol2atlas export — QC")
     v.add_image(atlas, name="ATLAS (cropped)", scale=voxel_um,
                 colormap="gray", blending="additive", opacity=0.5)
     v.add_image(sample, name="SAMPLE (warped)", scale=voxel_um,
-                colormap="magenta", blending="additive", opacity=0.6)
+                colormap="gray", blending="additive", opacity=0.7)
     napari.run()

@@ -15,20 +15,24 @@ from pathlib import Path
 import numpy as np
 
 from ..atlas import load_ccf
+from ..frame import compute_output_frame, enable_ccf_axes, extract_ccf
 from ..io import open_multiscale
 from ..state import save as save_state
 from ..transform import RigidTransform
 
 
-def run(state_path: Path) -> None:
+def run(state_path: Path, level: int | None = None,
+        preview_size: int = 192) -> None:
     from ..state import load
     state = load(state_path)
     if state.transform is None:
         raise RuntimeError("state.json has no transform — run `vol2atlas prealign` first.")
-    _run_napari(state, state_path)
+    _run_napari(state, state_path, level=level, preview_size=preview_size)
 
 
-def _run_napari(state, state_path: Path) -> None:
+def _run_napari(state, state_path: Path, *,
+                level: int | None = None,
+                preview_size: int = 192) -> None:
     import napari
     from qtpy.QtCore import QTimer, Qt
     from qtpy.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -38,17 +42,31 @@ def _run_napari(state, state_path: Path) -> None:
 
     # --------- load sample + atlas with crop ----------------------------
     ms = open_multiscale(state.sample_zarr)
-    arr = ms.level(state.sample_level)
+    use_level = state.sample_level if level is None else int(level)
+    arr = ms.level(use_level)
     if "c" in ms.axes:
         arr = arr[state.sample_channel]
-    sample_um = (tuple(state.sample_voxel_um) if state.sample_voxel_um
-                 else ms.spacing(state.sample_level))
+    # NOTE: state.sample_voxel_um is the LEVEL-0 voxel size override.
+    # For a different level, scale by the pyramid factor.
+    if state.sample_voxel_um is not None and use_level != state.sample_level:
+        anc = ms.spacing(state.sample_level)
+        cur = ms.spacing(use_level)
+        sample_um = tuple(v * (c / a) for v, a, c
+                           in zip(state.sample_voxel_um, anc, cur))
+    elif state.sample_voxel_um is not None:
+        sample_um = tuple(state.sample_voxel_um)
+    else:
+        sample_um = ms.spacing(use_level)
+    print(f"[step3] level {use_level}: {arr.shape} @ {sample_um} µm",
+          flush=True)
 
-    PREVIEW_MAX = 192 ** 3
+    PREVIEW_MAX = int(preview_size) ** 3
     n_vox = int(np.prod(arr.shape))
     if n_vox > PREVIEW_MAX:
         factor = max(1, int(np.ceil((n_vox / PREVIEW_MAX) ** (1 / 3))))
-        print(f"[step3] strided x{factor} for preview...", flush=True)
+        print(f"[step3] strided x{factor} for preview "
+              f"(budget {preview_size}^3 = {PREVIEW_MAX/1e6:.1f}M voxels)...",
+              flush=True)
         arr = arr[..., ::factor, ::factor, ::factor]
         sample_um = tuple(s * factor for s in sample_um)
     print(f"[step3] loading {arr.shape} into RAM...", flush=True)
@@ -57,16 +75,6 @@ def _run_napari(state, state_path: Path) -> None:
 
     ccf = load_ccf(state.atlas_name)
     ccf_ref_full = np.asarray(ccf.reference)
-    b = state.ccf_crop_bbox
-    if b is None:
-        ccf_data = ccf_ref_full
-        ccf_origin = (0.0, 0.0, 0.0)
-        crop_voxel_origin = np.zeros(3)
-    else:
-        z0, z1 = b["z"]; y0, y1 = b["y"]; x0, x1 = b["x"]
-        ccf_data = ccf_ref_full[z0:z1, y0:y1, x0:x1]
-        ccf_origin = (z0 * ccf.voxel_um[0], y0 * ccf.voxel_um[1], x0 * ccf.voxel_um[2])
-        crop_voxel_origin = np.array([z0, y0, x0], dtype=float)
 
     # --------- initial transform (with saved center) -------------------
     saved_center = tuple(state.transform.get("center_um")) \
@@ -75,15 +83,55 @@ def _run_napari(state, state_path: Path) -> None:
     tr0 = RigidTransform(
         **{k: state.transform[k] for k in
            ["rz_deg", "ry_deg", "rx_deg", "tz_um", "ty_um", "tx_um"]},
-        flip_z=bool(state.transform.get("flip_z", False)),
-        flip_y=bool(state.transform.get("flip_y", False)),
-        flip_x=bool(state.transform.get("flip_x", False)),
         center_um=saved_center,
     )
-    box = {"transform": tr0, "center_um": saved_center}
+    box = {"transform": tr0, "center_um": saved_center,
+           "ccf_data": None, "ccf_origin_um": None,
+           "affine_matrix": (np.asarray(state.affine, dtype=float)
+                              if state.affine is not None else None),
+           # Undo stack: list of (transform_dict, affine_matrix-or-None)
+           # snapshots, pushed BEFORE each Fit operation.
+           "undo_stack": []}
+
+    def _snapshot():
+        """Push current (transform, affine) onto the undo stack."""
+        snap_tr = (
+            box["transform"].rz_deg, box["transform"].ry_deg, box["transform"].rx_deg,
+            box["transform"].tz_um, box["transform"].ty_um, box["transform"].tx_um,
+            tuple(box["center_um"]),
+        )
+        snap_aff = (None if box["affine_matrix"] is None
+                    else box["affine_matrix"].copy())
+        box["undo_stack"].append((snap_tr, snap_aff))
+
+    def _apply_crop_ccf():
+        b = state.ccf_crop_bbox
+        if b is None:
+            box["ccf_data"] = ccf_ref_full
+            box["ccf_origin_um"] = (0.0, 0.0, 0.0)
+        else:
+            z0, z1 = b["z"]; y0, y1 = b["y"]; x0, x1 = b["x"]
+            box["ccf_data"] = ccf_ref_full[z0:z1, y0:y1, x0:x1]
+            box["ccf_origin_um"] = (z0 * ccf.voxel_um[0],
+                                    y0 * ccf.voxel_um[1],
+                                    x0 * ccf.voxel_um[2])
+
+    _apply_crop_ccf()
+    ccf_data = box["ccf_data"]; ccf_origin = box["ccf_origin_um"]
+    b = state.ccf_crop_bbox
+    crop_voxel_origin = (np.array([b["z"][0], b["y"][0], b["x"][0]], dtype=float)
+                         if b is not None else np.zeros(3))
 
     def _resample():
-        M = box["transform"].for_voxel_grid(sample_um, ccf.voxel_um)
+        # Combined µm transform = (state.affine if any) @ rigid
+        M_um = box["transform"].matrix()
+        if box.get("affine_matrix") is not None:
+            M_um = box["affine_matrix"] @ M_um
+        # µm → voxel (sample voxel → CCF crop voxel)
+        S_in   = np.diag([sample_um[0], sample_um[1], sample_um[2], 1.0])
+        S_out  = np.diag([1.0 / ccf.voxel_um[0], 1.0 / ccf.voxel_um[1],
+                          1.0 / ccf.voxel_um[2], 1.0])
+        M = S_out @ M_um @ S_in
         Minv = np.linalg.inv(M)
         offset = Minv[:3, :3] @ crop_voxel_origin + Minv[:3, 3]
         return affine_transform(
@@ -100,14 +148,16 @@ def _run_napari(state, state_path: Path) -> None:
         return float(a_lo), float(max(a_hi, a_lo + 1))
 
     viewer = napari.Viewer(ndisplay=2, title="vol2atlas landmarks — landmarks")
-    viewer.add_image(ccf_data, name="CCF", scale=ccf.voxel_um, translate=ccf_origin,
-                     colormap="gray", contrast_limits=_percentiles(ccf_data),
-                     opacity=0.5, blending="additive",
-                     interpolation2d="nearest", interpolation3d="nearest")
+    enable_ccf_axes(viewer, ccf.orientation)
+    ccf_layer = viewer.add_image(
+        ccf_data, name="CCF", scale=ccf.voxel_um, translate=ccf_origin,
+        colormap="gray", contrast_limits=_percentiles(ccf_data),
+        opacity=0.5, blending="additive",
+        interpolation2d="nearest", interpolation3d="nearest")
     sample_layer = viewer.add_image(
         _resample(), name="sample (live=saved)",
         scale=ccf.voxel_um, translate=ccf_origin,
-        colormap="magenta", contrast_limits=_percentiles(sample_np),
+        colormap="gray", contrast_limits=_percentiles(sample_np),
         opacity=0.6, blending="additive",
         interpolation2d="nearest", interpolation3d="nearest")
 
@@ -129,10 +179,19 @@ def _run_napari(state, state_path: Path) -> None:
     landmarks_sample = [tuple(p) for p in state.landmarks.get("sample_um", [])]
     landmarks_ccf    = [tuple(p) for p in state.landmarks.get("ccf_um",    [])]
 
+    def _M_full():
+        """Combined sample µm → world (= CCF µm) transform.
+        MUST match what _resample uses for the sample image, else
+        landmark dots drift off the sample volume."""
+        M = box["transform"].matrix()
+        if box.get("affine_matrix") is not None:
+            M = box["affine_matrix"] @ M
+        return M
+
     def _refresh_sample_lm_display():
         if not landmarks_sample:
             sample_lm_layer.data = np.empty((0, 3)); return
-        M = box["transform"].matrix()
+        M = _M_full()
         pts = np.asarray(landmarks_sample)
         world = (M[:3, :3] @ pts.T).T + M[:3, 3]
         sample_lm_layer.data = world
@@ -173,14 +232,21 @@ def _run_napari(state, state_path: Path) -> None:
         add_s_btn.setStyleSheet(""); add_c_btn.setStyleSheet("")
 
         if kind == "sample":
-            # Map world (CCF µm) → sample µm via inverse current transform
-            M = box["transform"].matrix()
+            # Map world (CCF µm) → raw sample µm via inverse of the FULL
+            # transform that _resample applies to render the sample volume.
+            # Using rigid-only here while _resample uses (affine @ rigid)
+            # makes landmarks captured AFTER an affine fit live in a
+            # different reference frame than landmarks captured BEFORE —
+            # LSQ on a mixed-frame set produces garbage.
+            M = _M_full()
             Minv = np.linalg.inv(M)
             s_pos = (Minv[:3, :3] @ world) + Minv[:3, 3]
             landmarks_sample.append(tuple(float(v) for v in s_pos))
             _refresh_sample_lm_display()
             print(f"[step3] + SAMPLE #{len(landmarks_sample)-1}: world={tuple(round(w,1) for w in world)} "
-                  f"-> sample_µm={tuple(round(v,1) for v in s_pos)}", flush=True)
+                  f"-> sample_µm={tuple(round(v,1) for v in s_pos)} "
+                  f"(affine={'YES' if box.get('affine_matrix') is not None else 'no'})",
+                  flush=True)
         else:
             landmarks_ccf.append(tuple(float(v) for v in world))
             _refresh_ccf_lm_display()
@@ -245,23 +311,17 @@ def _run_napari(state, state_path: Path) -> None:
         if n < 3:
             viewer.status = f"need ≥3 pairs (sample={len(landmarks_sample)}, ccf={len(landmarks_ccf)})"
             return
+        _snapshot()
         sp = np.asarray(landmarks_sample[:n]); cp = np.asarray(landmarks_ccf[:n])
-        # If flips are currently on, pre-apply them to source (Procrustes solves rotation only).
-        F = np.diag([
-            -1.0 if box["transform"].flip_z else 1.0,
-            -1.0 if box["transform"].flip_y else 1.0,
-            -1.0 if box["transform"].flip_x else 1.0,
-        ])
         c = np.asarray(box["center_um"])
-        sp_F = (sp - c) * np.diag(F) + c
-        src_c = sp_F.mean(0); tgt_c = cp.mean(0)
-        H = (sp_F - src_c).T @ (cp - tgt_c)
+        src_c = sp.mean(0); tgt_c = cp.mean(0)
+        H = (sp - src_c).T @ (cp - tgt_c)
         U, S, Vt = np.linalg.svd(H)
         d = float(np.sign(np.linalg.det(Vt.T @ U.T)) or 1.0)
         R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
         t = tgt_c - R @ src_c
-        rms = float(np.sqrt(np.mean(np.sum(((R @ sp_F.T).T + t - cp) ** 2, axis=1))))
-        per = np.sqrt(np.sum(((R @ sp_F.T).T + t - cp) ** 2, axis=1))
+        rms = float(np.sqrt(np.mean(np.sum(((R @ sp.T).T + t - cp) ** 2, axis=1))))
+        per = np.sqrt(np.sum(((R @ sp.T).T + t - cp) ** 2, axis=1))
         rz, ry, rx = Rotation.from_matrix(R).as_euler("ZYX", degrees=True)
 
         # Convert (R, t) → (rz, ry, rx, tz, ty, tx) given pivot c:
@@ -273,9 +333,6 @@ def _run_napari(state, state_path: Path) -> None:
             tz_um=float(t[0] + offset[0]),
             ty_um=float(t[1] + offset[1]),
             tx_um=float(t[2] + offset[2]),
-            flip_z=box["transform"].flip_z,
-            flip_y=box["transform"].flip_y,
-            flip_x=box["transform"].flip_x,
             center_um=box["center_um"],
         )
         box["transform"] = new_tr
@@ -290,6 +347,265 @@ def _run_napari(state, state_path: Path) -> None:
         viewer.status = f"fit: {n} pairs, RMS {rms:.0f} µm — see terminal for per-pair"
     fit_btn.clicked.connect(_fit)
     ctrl_v.addWidget(fit_btn)
+
+    # AFFINE fit button — 12 DOF least-squares from landmark pairs
+    fit_aff_btn = QPushButton("Fit AFFINE from landmarks (≥4 pairs)")
+    def _fit_affine():
+        n = min(len(landmarks_sample), len(landmarks_ccf))
+        if n < 4:
+            viewer.status = (f"need ≥4 non-coplanar pairs for affine "
+                             f"(have {n})")
+            return
+        _snapshot()
+        sp = np.asarray(landmarks_sample[:n], dtype=float)  # sample µm
+        cp = np.asarray(landmarks_ccf[:n],    dtype=float)  # CCF µm
+        # Least-squares affine: solve  M @ [sp; 1] = cp
+        # H = [sp, 1]_Nx4 ; A = H^+ @ cp  -> A is 4x3
+        H = np.hstack([sp, np.ones((n, 1))])
+        A_lstsq, *_ = np.linalg.lstsq(H, cp, rcond=None)
+        # Per-pair residuals
+        cp_pred = H @ A_lstsq
+        per = np.linalg.norm(cp_pred - cp, axis=1)
+        rms = float(np.sqrt(np.mean(per ** 2)))
+        # Build full 4x4 affine matrix: M[:3, :3] @ sp + M[:3, 3] = cp
+        # From A_lstsq (4x3): cp_i = H_i @ A_lstsq = sp_i @ A[:3, :] + A[3, :]
+        M_full = np.eye(4)
+        M_full[:3, :3] = A_lstsq[:3, :].T
+        M_full[:3,  3] = A_lstsq[3, :]
+        # Polar decomposition of M[:3, :3] = R @ S (R rotation, S stretch)
+        # gives a rough scale read-out for the user.
+        U, sv, Vt = np.linalg.svd(M_full[:3, :3])
+        # Save: state.affine = the full 4x4 (sample µm → CCF µm)
+        #       state.transform = identity rigid (the affine carries the
+        #       whole transform, no rigid pre-step needed)
+        box["transform"] = RigidTransform(center_um=box["center_um"])
+        box["affine_matrix"] = M_full
+        sample_layer.data = _resample()
+        _refresh_sample_lm_display()
+
+        print(f"\n[landmarks] AFFINE fit: {n} pairs, RMS = {rms:.1f} µm")
+        print(f"  singular values (per-axis scale): "
+              f"{sv[0]:.4f}  {sv[1]:.4f}  {sv[2]:.4f}  (1.0 = no scale)")
+        print(f"  translation (µm): "
+              f"{M_full[0,3]:+9.1f}  {M_full[1,3]:+9.1f}  {M_full[2,3]:+9.1f}")
+        for i, r in enumerate(per):
+            print(f"  pair {i:2d}: {r:7.1f} µm"
+                  + ("  ← outlier?" if r > 3 * rms else ""))
+        viewer.status = (f"affine fit: {n} pairs, RMS {rms:.0f} µm — see terminal")
+    fit_aff_btn.clicked.connect(_fit_affine)
+    ctrl_v.addWidget(fit_aff_btn)
+
+    # Revert: undo the last fit (pops one snapshot off the stack)
+    revert_btn = QPushButton("Revert last fit")
+    def _revert():
+        if not box["undo_stack"]:
+            viewer.status = "nothing to revert (no fit applied this session)"
+            return
+        snap_tr, snap_aff = box["undo_stack"].pop()
+        (rz, ry, rx, tz, ty, tx, c_um) = snap_tr
+        box["transform"] = RigidTransform(
+            rz_deg=float(rz), ry_deg=float(ry), rx_deg=float(rx),
+            tz_um=float(tz), ty_um=float(ty), tx_um=float(tx),
+            center_um=tuple(c_um),
+        )
+        box["affine_matrix"] = snap_aff
+        sample_layer.data = _resample()
+        _refresh_sample_lm_display()
+        depth = len(box["undo_stack"])
+        viewer.status = (f"reverted ({depth} undo step{'s' if depth != 1 else ''} left)")
+        print(f"[landmarks] reverted last fit ({depth} undo step{'s' if depth != 1 else ''} left)",
+              flush=True)
+    revert_btn.clicked.connect(_revert)
+    ctrl_v.addWidget(revert_btn)
+
+    # --------- Auto MI registration buttons ---------------------------
+    # Run ANTs MI (rigid/affine, intensity/shape) WITH current state +
+    # landmarks already in place. Updates state.transform / state.affine
+    # via step_mi.run, then reloads & refreshes the preview.
+    from qtpy.QtWidgets import QCheckBox
+    ctrl_v.addWidget(QLabel("<b>Auto MI registration</b>"))
+    mi_opts_row = QHBoxLayout()
+    cb_shape  = QCheckBox("SHAPE (SDT)")
+    cb_affine = QCheckBox("affine (12-DOF)")
+    cb_mask   = QCheckBox("ANTs mask")
+    mi_opts_row.addWidget(cb_shape); mi_opts_row.addWidget(cb_affine)
+    mi_opts_row.addWidget(cb_mask)
+    mw = QWidget(); mw.setLayout(mi_opts_row); ctrl_v.addWidget(mw)
+
+    def _build_in_memory_state():
+        """Snapshot current GUI state into an in-memory State object.
+        Does NOT touch state.json on disk. The MI/JOINT functions take
+        this and return a modified State; the GUI then updates box from
+        the return value. state.json only changes when the user clicks
+        an explicit Save button.
+        """
+        box["transform"].center_um = box["center_um"]
+        s = state              # reuse the loaded State (mutates it in-memory)
+        s.transform = box["transform"].to_dict()
+        s.affine = (box["affine_matrix"].tolist()
+                    if box.get("affine_matrix") is not None else None)
+        s.landmarks = {
+            "sample_um": [list(p) for p in landmarks_sample],
+            "ccf_um":    [list(p) for p in landmarks_ccf],
+        }
+        return s
+
+    def _apply_returned_state(new_state):
+        """Pull transform/affine from a returned State into box. No disk I/O."""
+        new_tr = new_state.transform
+        new_aff = new_state.affine
+        saved_c = (tuple(new_tr.get("center_um"))
+                    if new_tr.get("center_um") is not None
+                    else box["center_um"])
+        box["transform"] = RigidTransform(
+            **{k: new_tr[k] for k in
+               ["rz_deg","ry_deg","rx_deg","tz_um","ty_um","tx_um"]},
+            center_um=saved_c,
+        )
+        box["center_um"] = saved_c
+        box["affine_matrix"] = (np.asarray(new_aff, dtype=float)
+                                 if new_aff is not None else None)
+
+    run_mi_btn = QPushButton("Run MI now")
+    def _run_mi():
+        _snapshot()
+        in_state = _build_in_memory_state()
+        from .step_mi import run as run_mi
+        viewer.status = "Running ANTs MI... (see terminal)"
+        print("[landmarks] launching MI in-memory: "
+              f"shape={cb_shape.isChecked()}, affine={cb_affine.isChecked()}, "
+              f"mask={cb_mask.isChecked()} (state.json untouched)", flush=True)
+        try:
+            new_state = run_mi(in_state,
+                               shape=cb_shape.isChecked(),
+                               affine=cb_affine.isChecked(),
+                               mask=cb_mask.isChecked(),
+                               skip_view=True,
+                               check_mask=False)
+        except SystemExit as e:
+            print(f"[landmarks] MI aborted: {e}", flush=True)
+            viewer.status = f"MI aborted: {e}"
+            return
+        _apply_returned_state(new_state)
+        sample_layer.data = _resample()
+        _refresh_sample_lm_display()
+        viewer.status = "MI done — preview updated. Click Revert (or Save to keep)."
+        print("[landmarks] MI done. state.json unchanged until you Save.",
+              flush=True)
+    run_mi_btn.clicked.connect(_run_mi)
+    ctrl_v.addWidget(run_mi_btn)
+
+    # JOINT button — Mattes MI + landmark PSE in a single
+    # antsRegistration optimization. Uses the SHAPE/affine/mask
+    # checkboxes above + a landmark weight λ.
+    from qtpy.QtWidgets import QDoubleSpinBox
+    joint_row = QHBoxLayout()
+    joint_row.addWidget(QLabel("λ (landmark weight):"))
+    lam_sb = QDoubleSpinBox(); lam_sb.setRange(0.0, 1000.0)
+    lam_sb.setDecimals(1); lam_sb.setSingleStep(1.0); lam_sb.setValue(10.0)
+    joint_row.addWidget(lam_sb)
+    jw = QWidget(); jw.setLayout(joint_row); ctrl_v.addWidget(jw)
+
+    run_joint_btn = QPushButton("Run JOINT MI + landmarks (single opt)")
+    def _run_joint():
+        n = min(len(landmarks_sample), len(landmarks_ccf))
+        if n < 4:
+            viewer.status = f"joint needs ≥4 landmark pairs (have {n})"
+            return
+        _snapshot()
+        in_state = _build_in_memory_state()
+        from .step_mi import run_joint
+        viewer.status = "Running JOINT MI+landmarks... (see terminal)"
+        print(f"[landmarks] launching JOINT in-memory: "
+              f"shape={cb_shape.isChecked()}, affine={cb_affine.isChecked()}, "
+              f"mask={cb_mask.isChecked()}, λ={lam_sb.value()}, n_lm={n} "
+              f"(state.json untouched)", flush=True)
+        try:
+            new_state = run_joint(in_state,
+                                  shape=cb_shape.isChecked(),
+                                  affine=cb_affine.isChecked(),
+                                  mask=cb_mask.isChecked(),
+                                  landmark_weight=float(lam_sb.value()))
+        except SystemExit as e:
+            print(f"[landmarks] JOINT aborted: {e}", flush=True)
+            viewer.status = f"JOINT aborted: {e}"
+            return
+        _apply_returned_state(new_state)
+        sample_layer.data = _resample()
+        _refresh_sample_lm_display()
+        viewer.status = "JOINT done — preview updated. Click Revert (or Save to keep)."
+        print("[landmarks] JOINT done. state.json unchanged until you Save.",
+              flush=True)
+    run_joint_btn.clicked.connect(_run_joint)
+    ctrl_v.addWidget(run_joint_btn)
+
+    # ITERATIVE joint button: alternates regularized landmark LSQ and
+    # ANTs MI; iteration N's landmark fit is pulled toward iteration
+    # (N-1)'s MI result by λ.
+    from qtpy.QtWidgets import QSpinBox
+    iter_row = QHBoxLayout()
+    iter_row.addWidget(QLabel("max iter:"))
+    iter_sb = QSpinBox(); iter_sb.setRange(1, 50); iter_sb.setValue(5)
+    iter_row.addWidget(iter_sb)
+    iw = QWidget(); iw.setLayout(iter_row); ctrl_v.addWidget(iw)
+
+    run_joint_iter_btn = QPushButton(
+        "Run JOINT iterative (block-coord descent)")
+    def _run_joint_iter():
+        n = min(len(landmarks_sample), len(landmarks_ccf))
+        if n < 4:
+            viewer.status = f"iterative needs ≥4 landmark pairs (have {n})"
+            return
+        _snapshot()
+        in_state = _build_in_memory_state()
+        from .step_mi import run_joint_iter
+        viewer.status = "Running JOINT iterative... (see terminal)"
+        print(f"[landmarks] launching JOINT iterative in-memory: "
+              f"affine={cb_affine.isChecked()}, shape={cb_shape.isChecked()}, "
+              f"mask={cb_mask.isChecked()}, λ={lam_sb.value()}, "
+              f"max_iter={iter_sb.value()} (state.json untouched)", flush=True)
+        try:
+            new_state = run_joint_iter(in_state,
+                                       affine=cb_affine.isChecked(),
+                                       shape=cb_shape.isChecked(),
+                                       mask=cb_mask.isChecked(),
+                                       landmark_weight=float(lam_sb.value()),
+                                       max_iter=int(iter_sb.value()))
+        except SystemExit as e:
+            print(f"[landmarks] JOINT iter aborted: {e}", flush=True)
+            viewer.status = f"JOINT iter aborted: {e}"
+            return
+        _apply_returned_state(new_state)
+        sample_layer.data = _resample()
+        _refresh_sample_lm_display()
+        viewer.status = "JOINT iter done — preview updated (Save to keep)."
+        print("[landmarks] JOINT iter done. state.json unchanged until you Save.",
+              flush=True)
+    run_joint_iter_btn.clicked.connect(_run_joint_iter)
+    ctrl_v.addWidget(run_joint_iter_btn)
+
+    # Save without exit — keep the napari window open for more work
+    save_only_btn = QPushButton("Save state.json (keep window open)")
+    def _save_only():
+        box["transform"].center_um = box["center_um"]
+        state.transform = box["transform"].to_dict()
+        state.affine = (box["affine_matrix"].tolist()
+                        if box.get("affine_matrix") is not None else None)
+        state.landmarks = {
+            "sample_um": [list(p) for p in landmarks_sample],
+            "ccf_um":    [list(p) for p in landmarks_ccf],
+        }
+        has_affine = box.get("affine_matrix") is not None
+        state.add_history(
+            "landmarks",
+            f"{len(landmarks_sample)} sample, {len(landmarks_ccf)} CCF landmarks"
+            + (f", affine fitted" if has_affine else "") + " (intermediate save)",
+        )
+        save_state(state, state_path)
+        viewer.status = f"saved -> {state_path}"
+        print(f"[landmarks] saved -> {state_path} (window still open)", flush=True)
+    save_only_btn.clicked.connect(_save_only)
+    ctrl_v.addWidget(save_only_btn)
 
     clear_btn = QPushButton("Clear ALL landmarks")
     def _clear_all():
@@ -315,12 +631,20 @@ def _run_napari(state, state_path: Path) -> None:
     def _save_and_exit():
         box["transform"].center_um = box["center_um"]
         state.transform = box["transform"].to_dict()
+        if box.get("affine_matrix") is not None:
+            state.affine = box["affine_matrix"].tolist()
+        else:
+            state.affine = None
         state.landmarks = {
             "sample_um": [list(p) for p in landmarks_sample],
             "ccf_um":    [list(p) for p in landmarks_ccf],
         }
-        state.add_history("landmarks",
-                          f"{len(landmarks_sample)} sample, {len(landmarks_ccf)} CCF landmarks")
+        has_affine = box.get("affine_matrix") is not None
+        state.add_history(
+            "landmarks",
+            f"{len(landmarks_sample)} sample, {len(landmarks_ccf)} CCF landmarks"
+            + (f", affine fitted" if has_affine else ""),
+        )
         save_state(state, state_path)
         print(f"[step3] saved -> {state_path}", flush=True)
         viewer.close()

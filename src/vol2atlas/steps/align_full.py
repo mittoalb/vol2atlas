@@ -32,6 +32,7 @@ import zarr
 from ome_zarr.io import parse_url
 
 from ..atlas import load_ccf
+from ..frame import compute_output_frame
 from ..io import open_multiscale
 from ..state import load as load_state, save as save_state
 from ..transform import RigidTransform
@@ -53,31 +54,18 @@ def run(
     ms  = open_multiscale(state.sample_zarr)
     ccf = load_ccf(state.atlas_name)
 
-    # CCF crop in atlas voxels + µm (full-atlas frame).
     atlas_voxel_um = np.asarray(ccf.voxel_um, dtype=float)
-    b = state.ccf_crop_bbox
-    if b is None:
-        crop_origin_vox = np.zeros(3)
-        crop_size_vox   = np.asarray(ccf.reference.shape, dtype=float)
-    else:
-        crop_origin_vox = np.asarray([b["z"][0], b["y"][0], b["x"][0]], dtype=float)
-        crop_size_vox   = np.asarray([b["z"][1] - b["z"][0],
-                                       b["y"][1] - b["y"][0],
-                                       b["x"][1] - b["x"][0]], dtype=float)
-    crop_origin_um = crop_origin_vox * atlas_voxel_um
-    crop_size_um   = crop_size_vox   * atlas_voxel_um
-    print(f"[alignFull] CCF crop  origin={tuple(crop_origin_um)} µm  "
-          f"size={tuple(crop_size_um)} µm")
 
     rigid = RigidTransform(
         **{k: state.transform[k] for k in
            ["rz_deg", "ry_deg", "rx_deg", "tz_um", "ty_um", "tx_um"]},
-        flip_z=bool(state.transform.get("flip_z", False)),
-        flip_y=bool(state.transform.get("flip_y", False)),
-        flip_x=bool(state.transform.get("flip_x", False)),
         center_um=tuple(state.transform.get("center_um", (0.0, 0.0, 0.0))),
     )
-    M_um    = rigid.matrix()
+    M_um = rigid.matrix()
+    if state.affine is not None:
+        A_um = np.asarray(state.affine, dtype=float)
+        M_um = A_um @ M_um
+        print(f"[alignFull] composing state.affine on top of rigid")
     Minv_um = np.linalg.inv(M_um)
 
     avail = list(range(ms.n_levels()))
@@ -106,16 +94,24 @@ def run(
         max_workers = int(os.environ.get("DASK_NUM_WORKERS",
                                           os.cpu_count() or 4))
 
+    # Output frame = user's CCF crop bbox (no union with rotated sample).
+    b = state.ccf_crop_bbox
+    if b is None:
+        crop_origin_vox = np.zeros(3)
+        crop_size_vox   = np.asarray(ccf.reference.shape, dtype=float)
+    else:
+        crop_origin_vox = np.asarray([b["z"][0], b["y"][0], b["x"][0]], dtype=float)
+        crop_size_vox   = np.asarray([b["z"][1] - b["z"][0],
+                                       b["y"][1] - b["y"][0],
+                                       b["x"][1] - b["x"][0]], dtype=float)
+    crop_origin_um = crop_origin_vox * atlas_voxel_um
+    crop_size_um   = crop_size_vox   * atlas_voxel_um
+    print(f"[alignFull] CCF crop  origin={tuple(crop_origin_um)} µm  "
+          f"size={tuple(crop_size_um)} µm")
+
     scales: list[list[float]] = []
     for out_idx, level in enumerate(target_levels):
         sample_um = voxel_um_at(level)
-        out_shape = tuple(int(np.ceil(crop_size_um[a] / sample_um[a]))
-                          for a in range(3))
-
-        D      = np.diag(sample_um)
-        D_inv  = np.diag(1.0 / sample_um)
-        M_v    = D_inv @ Minv_um[:3, :3] @ D
-        off_v  = D_inv @ (Minv_um[:3, :3] @ crop_origin_um + Minv_um[:3, 3])
 
         # The dask-array level wraps the underlying zarr. Get the raw zarr
         # array for direct (chunk-aware) reads with no graph overhead.
@@ -124,6 +120,14 @@ def run(
             arr_dask = arr_dask[state.sample_channel]
         in_shape = tuple(int(s) for s in arr_dask.shape)
         in_dtype = arr_dask.dtype
+
+        out_shape = tuple(int(np.ceil(crop_size_um[a] / sample_um[a]))
+                          for a in range(3))
+
+        D      = np.diag(sample_um)
+        D_inv  = np.diag(1.0 / sample_um)
+        M_v    = D_inv @ Minv_um[:3, :3] @ D
+        off_v  = D_inv @ (Minv_um[:3, :3] @ crop_origin_um + Minv_um[:3, 3])
 
         chunks_out = (output_chunks if output_chunks is not None
                       else _pick_default_chunks(arr_dask))

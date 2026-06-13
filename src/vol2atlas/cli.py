@@ -20,10 +20,24 @@ def init(
     voxel_um: Optional[str] = typer.Option(
         None, "--voxel-um",
         help="Override source voxel size in µm. Single float or comma-separated z,y,x."),
+    sample_orientation: Optional[str] = typer.Option(
+        None, "--orientation",
+        help="3-letter BrainGlobe orientation code for the SAMPLE volume "
+             "(R/L, A/P, S/I — e.g. 'asr', 'psr', 'sai'). Each letter "
+             "says which anatomical direction the corresponding numpy "
+             "axis INCREASES TOWARD: R=right, A=anterior, S=superior, "
+             "L=left, P=posterior, I=inferior. Allen CCF default is "
+             "'asr'. If supplied, init pre-populates state.transform "
+             "with the rotation that maps sample → atlas orientation, "
+             "so prealign opens with the sample already roughly aligned "
+             "(no manual ±90° / 180° rotations needed)."),
 ):
     """Create a new state.json from a zarr path. Does not open napari."""
     from .io import open_multiscale
     from .state import State, save as save_state
+    from .atlas import load_ccf
+    from .orientation import rotation_between, euler_zyx_degrees_from_matrix
+    from .transform import RigidTransform
 
     try:
         ms = open_multiscale(zarr_path)
@@ -43,14 +57,50 @@ def init(
                         fg="red", err=True); raise typer.Exit(2)
         vox_list = parts
 
+    initial_transform = None
+    if sample_orientation:
+        try:
+            ccf = load_ccf(atlas)
+        except Exception as e:
+            typer.secho(f"could not load atlas {atlas!r}: {e}",
+                        fg="red", err=True); raise typer.Exit(2)
+        try:
+            R = rotation_between(sample_orientation, ccf.orientation)
+        except ValueError as e:
+            typer.secho(str(e), fg="red", err=True); raise typer.Exit(2)
+        rz, ry, rx = euler_zyx_degrees_from_matrix(R)
+        # Use sample volume center as the rotation pivot so the
+        # pre-rotation doesn't push the sample out of view.
+        sample_shape = ms.level(level).shape
+        if "c" in ms.axes:
+            sample_shape = sample_shape[1:]   # drop channel dim
+        sample_sp = (tuple(vox_list) if vox_list else ms.spacing(level))
+        center_um = tuple((s - 1) * v / 2.0
+                          for s, v in zip(sample_shape, sample_sp))
+        initial_transform = RigidTransform(
+            rz_deg=rz, ry_deg=ry, rx_deg=rx,
+            tz_um=0.0, ty_um=0.0, tx_um=0.0,
+            center_um=center_um,
+        ).to_dict()
+        typer.echo(
+            f"orientation: sample {sample_orientation!r} → atlas "
+            f"{ccf.orientation!r}  ⇒  initial rotation "
+            f"(rz={rz:+.1f}, ry={ry:+.1f}, rx={rx:+.1f}) deg"
+        )
+
     s = State(
         sample_zarr=str(zarr_path.resolve()),
         sample_level=level,
         sample_voxel_um=vox_list,
         sample_channel=channel,
         atlas_name=atlas,
+        sample_orientation=sample_orientation,
+        transform=initial_transform,
     )
-    s.add_history("init", f"level={level} voxel_um={vox_list}")
+    s.add_history(
+        "init",
+        f"level={level} voxel_um={vox_list} orientation={sample_orientation}",
+    )
     save_state(s, state)
     typer.echo(f"wrote {state}")
     typer.echo(ms.summary())
@@ -60,28 +110,126 @@ def init(
 @app.command()
 def prealign(
     state: Path = typer.Argument(Path("state.json"), help="State file."),
+    level: Optional[int] = typer.Option(
+        None, "--level",
+        help="Pyramid level to load. Default = state.sample_level."),
+    preview_size: int = typer.Option(
+        192, "--preview-size",
+        help="Cube root of max preview voxel budget. Default 192."),
+    orientation: Optional[str] = typer.Option(
+        None, "--orientation",
+        help="3-letter BrainGlobe orientation code for the SAMPLE "
+             "(e.g. 'pir', 'psl'). Overrides any existing transform "
+             "with the rotation that maps sample → atlas orientation, "
+             "so napari opens with the sample roughly aligned. Other "
+             "state fields (ccf_crop_bbox, landmarks, history, affine) "
+             "are NOT touched. Re-launch prealign with a different "
+             "code to iterate. Sample must be right-handed; refused "
+             "if it requires a flip."),
 ):
-    """3D rough prealign (translation/rotation sliders, axis flips) + CCF crop ROI."""
+    """3D rough prealign (translation/rotation sliders) + CCF crop ROI."""
     from .steps.step1_prealign import run
-    run(state)
+    run(state, level=level, preview_size=preview_size,
+        orientation=orientation)
 
 
 @app.command()
 def refine(
     state: Path = typer.Argument(Path("state.json"), help="State file."),
+    level: Optional[int] = typer.Option(
+        None, "--level",
+        help="Pyramid level to load. Default = state.sample_level. "
+             "Use a finer level (lower number) for higher-resolution preview."),
+    preview_size: int = typer.Option(
+        192, "--preview-size",
+        help="Cube root of max preview voxel budget. Default 192 "
+             "(=7 M voxels, fast). Higher = sharper preview, slower."),
 ):
     """Fine refinement in axial / coronal / sagittal views with tight slider ranges."""
     from .steps.step2_refine import run
-    run(state)
+    run(state, level=level, preview_size=preview_size)
 
 
 @app.command()
 def landmarks(
     state: Path = typer.Argument(Path("state.json"), help="State file."),
+    level: Optional[int] = typer.Option(
+        None, "--level",
+        help="Pyramid level to load for landmark picking. Default = "
+             "state.sample_level. Use a finer level (lower number) "
+             "for higher-resolution preview."),
+    preview_size: int = typer.Option(
+        192, "--preview-size",
+        help="Cube root of max preview voxel budget. Default 192 "
+             "(=7 M voxels, fast). Raise for higher-res preview at "
+             "the cost of slower rendering. e.g. 360 = ~47 M voxels."),
 ):
-    """Pick landmark pairs on sample + CCF; optional Procrustes rigid fit."""
+    """Pick landmark pairs on sample + CCF; rigid Procrustes OR
+    full-affine least-squares fit."""
     from .steps.step3_landmarks import run
-    run(state)
+    run(state, level=level, preview_size=preview_size)
+
+
+@app.command()
+def mi(
+    state: Path = typer.Argument(Path("state.json"), help="State file."),
+    level: Optional[int] = typer.Option(
+        None, "--level",
+        help="Pyramid level to register on. Default = state.sample_level."),
+    mask: bool = typer.Option(
+        False, "--mask",
+        help="Enable Otsu brain masks (default: off — masks tend to "
+             "trap MI on partial / cross-modality data)."),
+    affine: bool = typer.Option(
+        False, "--affine",
+        help="Run AFFINE (12-DOF: rigid + scale + shear) instead of "
+             "rigid. Result saved to state.affine and composed on top "
+             "of state.transform at export/alignFull time."),
+    shape: bool = typer.Option(
+        False, "--shape",
+        help="Register the SHAPE (signed distance transforms of brain "
+             "masks) instead of raw intensities."),
+    mask_percentile: float = typer.Option(
+        50.0, "--mask-percentile",
+        help="Percentile of nonzero SAMPLE voxels for the brain mask. "
+             "Higher = tighter (only brightest tissue). For µCT 50-80, "
+             "for fluorescence 10-30."),
+    mask_threshold: Optional[float] = typer.Option(
+        None, "--mask-threshold",
+        help="Absolute sample-intensity threshold; overrides "
+             "--mask-percentile."),
+    ccf_mask_percentile: float = typer.Option(
+        60.0, "--ccf-mask-percentile",
+        help="Percentile of nonzero CCF voxels for the CCF brain mask. "
+             "Default 60 (good for the Allen Nissl template)."),
+    ccf_mask_threshold: Optional[float] = typer.Option(
+        None, "--ccf-mask-threshold",
+        help="Absolute CCF-intensity threshold; overrides "
+             "--ccf-mask-percentile."),
+    check_mask: bool = typer.Option(
+        False, "--check-mask",
+        help="Show the brain mask in napari and exit. Use to tune "
+             "--mask-percentile / --mask-threshold without running "
+             "the registration."),
+    skip_view: bool = typer.Option(
+        False, "--skip-view",
+        help="Headless: save without the napari Accept/Reject preview."),
+):
+    """Automated rigid (or affine) refinement via Mutual Information.
+
+    Default: Rigid + Mattes MI on raw intensities → state.transform.
+    --affine: Affine (12-DOF) → state.affine (composed on top of rigid).
+    --shape:  register signed distance transforms of brain masks
+              instead of intensities — cross-modality safe.
+    Requires antspyx (`pip install antspyx` or `pip install -e .\\[ants]`)."""
+    from .steps.step_mi import run
+    run(state, level=level, mask=mask, skip_view=skip_view,
+        affine=affine, shape=shape,
+        mask_percentile=mask_percentile,
+        mask_threshold=mask_threshold,
+        ccf_mask_percentile=ccf_mask_percentile,
+        ccf_mask_threshold=ccf_mask_threshold,
+        check_mask=check_mask)
 
 
 @app.command()

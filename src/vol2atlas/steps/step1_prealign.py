@@ -14,18 +14,54 @@ from typing import Optional
 import numpy as np
 
 from ..atlas import load_ccf
+from ..frame import compute_output_frame, enable_ccf_axes, extract_ccf
 from ..io import open_multiscale
 from ..state import State, save as save_state
 from ..transform import RigidTransform
 
 
-def run(state_path: Path) -> None:
+def run(state_path: Path, level: int | None = None,
+        preview_size: int = 192,
+        orientation: str | None = None) -> None:
     from ..state import load
     state = load(state_path)
-    _run_napari(state, state_path)
+    if orientation:
+        # Compute rotation from sample → atlas orientation and seed
+        # state.transform with it. Pivot on sample center so the rotation
+        # doesn't push the volume out of frame. Other state fields are
+        # untouched.
+        from ..atlas import load_ccf
+        from ..orientation import (rotation_between,
+                                    euler_zyx_degrees_from_matrix)
+        from ..transform import RigidTransform
+        from ..io import open_multiscale
+        ccf = load_ccf(state.atlas_name)
+        R = rotation_between(orientation, ccf.orientation)
+        rz, ry, rx = euler_zyx_degrees_from_matrix(R)
+        ms = open_multiscale(state.sample_zarr)
+        use_level = state.sample_level if level is None else int(level)
+        sample_shape = ms.level(use_level).shape
+        if "c" in ms.axes:
+            sample_shape = sample_shape[1:]
+        sample_sp = (tuple(state.sample_voxel_um) if state.sample_voxel_um
+                     else ms.spacing(use_level))
+        center_um = tuple((s - 1) * v / 2.0
+                          for s, v in zip(sample_shape, sample_sp))
+        state.transform = RigidTransform(
+            rz_deg=rz, ry_deg=ry, rx_deg=rx,
+            tz_um=0.0, ty_um=0.0, tx_um=0.0,
+            center_um=center_um,
+        ).to_dict()
+        state.sample_orientation = orientation
+        print(f"[step1] orientation override: sample {orientation!r} → "
+              f"atlas {ccf.orientation!r}  ⇒  rotation "
+              f"(rz={rz:+.1f}, ry={ry:+.1f}, rx={rx:+.1f}) deg", flush=True)
+    _run_napari(state, state_path, level=level, preview_size=preview_size)
 
 
-def _run_napari(state: State, state_path: Path) -> None:
+def _run_napari(state: State, state_path: Path, *,
+                level: int | None = None,
+                preview_size: int = 192) -> None:
     import napari
     from qtpy.QtCore import QTimer
     from qtpy.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -36,17 +72,29 @@ def _run_napari(state: State, state_path: Path) -> None:
 
     # -------- load sample preview + atlas ---------------------------------
     ms = open_multiscale(state.sample_zarr)
-    arr = ms.level(state.sample_level)
+    use_level = state.sample_level if level is None else int(level)
+    arr = ms.level(use_level)
     if "c" in ms.axes:
         arr = arr[state.sample_channel]
-    sample_um = (tuple(state.sample_voxel_um) if state.sample_voxel_um
-                 else ms.spacing(state.sample_level))
+    if state.sample_voxel_um is not None and use_level != state.sample_level:
+        anc = ms.spacing(state.sample_level)
+        cur = ms.spacing(use_level)
+        sample_um = tuple(v * (c / a) for v, a, c
+                           in zip(state.sample_voxel_um, anc, cur))
+    elif state.sample_voxel_um is not None:
+        sample_um = tuple(state.sample_voxel_um)
+    else:
+        sample_um = ms.spacing(use_level)
+    print(f"[step1] level {use_level}: {arr.shape} @ {sample_um} µm",
+          flush=True)
 
-    PREVIEW_MAX = 192 ** 3
+    PREVIEW_MAX = int(preview_size) ** 3
     n_vox = int(np.prod(arr.shape))
     if n_vox > PREVIEW_MAX:
         factor = max(1, int(np.ceil((n_vox / PREVIEW_MAX) ** (1 / 3))))
-        print(f"[step1] strided x{factor} for preview...", flush=True)
+        print(f"[step1] strided x{factor} for preview "
+              f"(budget {preview_size}^3 = {PREVIEW_MAX/1e6:.1f}M voxels)...",
+              flush=True)
         arr = arr[..., ::factor, ::factor, ::factor]
         sample_um = tuple(s * factor for s in sample_um)
     print(f"[step1] loading {arr.shape} into RAM...", flush=True)
@@ -86,31 +134,28 @@ def _run_napari(state: State, state_path: Path) -> None:
         tr0 = RigidTransform(
             **{k: state.transform[k] for k in
                ["rz_deg", "ry_deg", "rx_deg", "tz_um", "ty_um", "tx_um"]},
-            flip_z=bool(state.transform.get("flip_z", False)),
-            flip_y=bool(state.transform.get("flip_y", False)),
-            flip_x=bool(state.transform.get("flip_x", False)),
             center_um=saved_center,
         )
 
-    box = {"transform": tr0, "ccf_data": None}
+    box = {"transform": tr0, "ccf_data": None, "ccf_origin_um": None}
 
-    # -------- apply crop to CCF view -----------------------------------
-    def _apply_crop():
+    # -------- CCF layer reflects ONLY the user's crop bbox -------------
+    def _apply_crop_ccf():
         b = state.ccf_crop_bbox
         if b is None:
             box["ccf_data"] = ccf_ref_full
             box["ccf_origin_um"] = (0.0, 0.0, 0.0)
         else:
             z0, z1 = b["z"]; y0, y1 = b["y"]; x0, x1 = b["x"]
-            cropped = ccf_ref_full[z0:z1, y0:y1, x0:x1]
-            box["ccf_data"] = cropped
+            box["ccf_data"] = ccf_ref_full[z0:z1, y0:y1, x0:x1]
             box["ccf_origin_um"] = (z0 * ccf.voxel_um[0],
                                     y0 * ccf.voxel_um[1],
                                     x0 * ccf.voxel_um[2])
-    _apply_crop()
+    _apply_crop_ccf()
 
     # -------- napari viewer --------------------------------------------
     viewer = napari.Viewer(ndisplay=3, title="vol2atlas prealign: prealign + crop")
+    enable_ccf_axes(viewer, ccf.orientation)
 
     ccf_layer = viewer.add_image(
         box["ccf_data"], name="CCF",
@@ -119,39 +164,22 @@ def _run_napari(state: State, state_path: Path) -> None:
         blending="additive", rendering="mip",
     )
 
-    # Sample layer: a scipy resample onto the CCF (cropped) voxel grid.
-    def _resample():
-        ccf_data = box["ccf_data"]
-        M = box["transform"].for_voxel_grid(sample_um, ccf.voxel_um)
-        Minv = np.linalg.inv(M)
-        # offset the resampling so it lands in the CROPPED grid
-        b = state.ccf_crop_bbox
-        if b is None:
-            out_offset_voxel = np.zeros(3)
-        else:
-            out_offset_voxel = np.array([b["z"][0], b["y"][0], b["x"][0]])
-        offset = Minv[:3, :3] @ out_offset_voxel + Minv[:3, 3]
-        return affine_transform(
-            sample_np, Minv[:3, :3], offset=offset,
-            output_shape=ccf_data.shape, order=0, mode="constant", cval=0,
-        )
-
+    # Sample shown via napari's GPU-applied layer.affine transform.
+    # No scipy.affine_transform per slider tick — just an updated affine
+    # matrix that vispy applies at render time. Same speed as ImageJ.
     sample_layer = viewer.add_image(
-        _resample(), name="sample (live = saved)",
-        scale=ccf.voxel_um, translate=box["ccf_origin_um"],
-        colormap="magenta", contrast_limits=sample_clim, opacity=0.6,
+        sample_np, name="sample (live = saved)",
+        scale=sample_um,
+        colormap="gray", contrast_limits=sample_clim, opacity=0.6,
         blending="additive", rendering="mip",
     )
+    sample_layer.affine = tr0.matrix()
 
-    # (crop is driven by sliders below, not freehand shapes)
-
-    # Debounced redraw
-    redraw_timer = QTimer(); redraw_timer.setSingleShot(True)
+    # Redraw: just update the affine matrix. GPU does the rest.
     def _redraw():
-        sample_layer.data = _resample()
-    redraw_timer.timeout.connect(_redraw)
+        sample_layer.affine = box["transform"].matrix()
     def _schedule_redraw():
-        redraw_timer.start(150)
+        _redraw()      # instant — no debounce needed
 
     # -------- controls panel -------------------------------------------
     ctrl = QWidget(); ctrl_layout = QVBoxLayout(ctrl)
@@ -160,11 +188,9 @@ def _run_napari(state: State, state_path: Path) -> None:
     abs_lbl = QLabel(); ctrl_layout.addWidget(abs_lbl)
     def _refresh_label():
         t = box["transform"]
-        flips = "".join(a for a, f in zip("zyx", (t.flip_z, t.flip_y, t.flip_x)) if f) or "—"
         abs_lbl.setText(
             f"<pre>tz={t.tz_um:+8.1f}  ty={t.ty_um:+8.1f}  tx={t.tx_um:+8.1f} µm\n"
-            f"rz={t.rz_deg:+7.2f}  ry={t.ry_deg:+7.2f}  rx={t.rx_deg:+7.2f} deg\n"
-            f"flips: {flips}</pre>"
+            f"rz={t.rz_deg:+7.2f}  ry={t.ry_deg:+7.2f}  rx={t.rx_deg:+7.2f} deg</pre>"
         )
 
     def _spin(label, default, vmin, vmax, step, setter):
@@ -219,19 +245,6 @@ def _run_napari(state: State, state_path: Path) -> None:
         w, _ = _spin(attr, getattr(tr0, attr), -180.0, 180.0, 1.0, _setter(attr))
         ctrl_layout.addWidget(w)
 
-    ctrl_layout.addWidget(QLabel("<b>Flips</b>"))
-    flip_row = QHBoxLayout()
-    flip_chks = {}
-    for axis in ("z", "y", "x"):
-        cb = QCheckBox(axis); cb.setChecked(getattr(tr0, f"flip_{axis}"))
-        def _make(ax):
-            return lambda checked: (setattr(box["transform"], f"flip_{ax}", bool(checked)),
-                                     _refresh_label(), _schedule_redraw())
-        cb.stateChanged.connect(_make(axis))
-        flip_chks[axis] = cb; flip_row.addWidget(cb)
-    flip_row.addStretch(1)
-    fr = QWidget(); fr.setLayout(flip_row); ctrl_layout.addWidget(fr)
-
     ctrl_layout.addStretch(1)
 
     # -------- crop tab: 6 sliders (min/max per axis), live preview ----
@@ -276,16 +289,13 @@ def _run_napari(state: State, state_path: Path) -> None:
         crop_state["rebuild_timer"].start(80)
 
     def _rebuild_crop():
-        # Sync state and rebuild layers
         full = (crop_state["bbox"]["z"] == [0, ccf_ref_full.shape[0]]
                 and crop_state["bbox"]["y"] == [0, ccf_ref_full.shape[1]]
                 and crop_state["bbox"]["x"] == [0, ccf_ref_full.shape[2]])
         state.ccf_crop_bbox = None if full else dict(crop_state["bbox"])
-        _apply_crop()
+        _apply_crop_ccf()
         ccf_layer.data = box["ccf_data"]
         ccf_layer.translate = box["ccf_origin_um"]
-        sample_layer.translate = box["ccf_origin_um"]
-        _schedule_redraw()
     crop_state["rebuild_timer"].timeout.connect(_rebuild_crop)
 
     clear_crop_btn = QPushButton("Reset crop (use full CCF)")
@@ -325,7 +335,7 @@ def _run_napari(state: State, state_path: Path) -> None:
 
     _refresh_label()
     print("\n[step1] napari open in 3D MIP.")
-    print("[step1] adjust translation/rotation/flips on the 'transform' tab.")
+    print("[step1] adjust translation/rotation on the 'transform' tab.")
     print("[step1] draw a crop box on the 'CCF crop ROI' layer, then 'Apply crop'.")
     print("[step1] click 'Save state.json && exit' when done.")
     napari.run()

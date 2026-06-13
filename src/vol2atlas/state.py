@@ -10,6 +10,9 @@ Schema (all fields optional except sample_zarr + atlas_name + sample_level):
       "atlas_name": "allen_mouse_25um",
       "ccf_crop_bbox": {"z":[z0,z1], "y":[y0,y1], "x":[x0,x1]} | null,
       "transform": { ...RigidTransform.to_dict() ... } | null,
+      "affine":    [[a, b, c, d], [e, f, g, h], [i, j, k, l], [0, 0, 0, 1]] | null,
+                   # 4x4 in CCF µm space, applied AFTER `transform` at
+                   # export/alignFull time. Output from `vol2atlas mi --affine`.
       "landmarks": {
           "sample_um": [[z,y,x], ...],
           "ccf_um":    [[z,y,x], ...]
@@ -37,8 +40,14 @@ class State:
     atlas_name: str
     sample_voxel_um: Optional[list] = None
     sample_channel: int = 0
+    # 3-letter BrainGlobe orientation code for the sample (e.g. "asr",
+    # "psr"). Optional; if set, init pre-populates state.transform with
+    # the rotation that maps this orientation to the atlas's orientation
+    # so prealign opens with the sample already roughly aligned.
+    sample_orientation: Optional[str] = None
     ccf_crop_bbox: Optional[dict] = None
     transform: Optional[dict] = None
+    affine: Optional[list] = None        # 4x4 in CCF µm, composed after `transform`
     landmarks: dict = field(default_factory=lambda: {"sample_um": [], "ccf_um": []})
     history: list = field(default_factory=list)
 
@@ -54,7 +63,9 @@ class State:
 
     @classmethod
     def from_dict(cls, d: dict) -> "State":
-        return cls(**d)
+        # Tolerate older state files missing newer fields.
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 def save(state: State, path: Path) -> None:

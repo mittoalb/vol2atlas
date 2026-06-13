@@ -13,20 +13,24 @@ from pathlib import Path
 import numpy as np
 
 from ..atlas import load_ccf
+from ..frame import compute_output_frame, enable_ccf_axes, extract_ccf
 from ..io import open_multiscale
 from ..state import save as save_state
 from ..transform import RigidTransform
 
 
-def run(state_path: Path) -> None:
+def run(state_path: Path, level: int | None = None,
+        preview_size: int = 192) -> None:
     from ..state import load
     state = load(state_path)
     if state.transform is None:
         raise RuntimeError("state.json has no transform — run `vol2atlas prealign` first.")
-    _run_napari(state, state_path)
+    _run_napari(state, state_path, level=level, preview_size=preview_size)
 
 
-def _run_napari(state, state_path: Path) -> None:
+def _run_napari(state, state_path: Path, *,
+                level: int | None = None,
+                preview_size: int = 192) -> None:
     import napari
     from qtpy.QtCore import QTimer, Qt
     from qtpy.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -36,17 +40,29 @@ def _run_napari(state, state_path: Path) -> None:
 
     # --------- load sample + atlas (with crop) -----------------------
     ms = open_multiscale(state.sample_zarr)
-    arr = ms.level(state.sample_level)
+    use_level = state.sample_level if level is None else int(level)
+    arr = ms.level(use_level)
     if "c" in ms.axes:
         arr = arr[state.sample_channel]
-    sample_um = (tuple(state.sample_voxel_um) if state.sample_voxel_um
-                 else ms.spacing(state.sample_level))
+    if state.sample_voxel_um is not None and use_level != state.sample_level:
+        anc = ms.spacing(state.sample_level)
+        cur = ms.spacing(use_level)
+        sample_um = tuple(v * (c / a) for v, a, c
+                           in zip(state.sample_voxel_um, anc, cur))
+    elif state.sample_voxel_um is not None:
+        sample_um = tuple(state.sample_voxel_um)
+    else:
+        sample_um = ms.spacing(use_level)
+    print(f"[step2] level {use_level}: {arr.shape} @ {sample_um} µm",
+          flush=True)
 
-    PREVIEW_MAX = 192 ** 3
+    PREVIEW_MAX = int(preview_size) ** 3
     n_vox = int(np.prod(arr.shape))
     if n_vox > PREVIEW_MAX:
         factor = max(1, int(np.ceil((n_vox / PREVIEW_MAX) ** (1 / 3))))
-        print(f"[step2] strided x{factor} for preview...", flush=True)
+        print(f"[step2] strided x{factor} for preview "
+              f"(budget {preview_size}^3 = {PREVIEW_MAX/1e6:.1f}M voxels)...",
+              flush=True)
         arr = arr[..., ::factor, ::factor, ::factor]
         sample_um = tuple(s * factor for s in sample_um)
     print(f"[step2] loading {arr.shape} into RAM...", flush=True)
@@ -55,17 +71,6 @@ def _run_napari(state, state_path: Path) -> None:
 
     ccf = load_ccf(state.atlas_name)
     ccf_ref_full = np.asarray(ccf.reference)
-    b = state.ccf_crop_bbox
-    if b is None:
-        ccf_data = ccf_ref_full
-        ccf_origin = (0.0, 0.0, 0.0)
-        crop_voxel_origin = np.zeros(3)
-    else:
-        z0, z1 = b["z"]; y0, y1 = b["y"]; x0, x1 = b["x"]
-        ccf_data = ccf_ref_full[z0:z1, y0:y1, x0:x1]
-        ccf_origin = (z0 * ccf.voxel_um[0], y0 * ccf.voxel_um[1], x0 * ccf.voxel_um[2])
-        crop_voxel_origin = np.array([z0, y0, x0], dtype=float)
-    print(f"[step2] CCF crop: {ccf_data.shape} at origin {ccf_origin} µm")
 
     # --------- initial transform -------------------------------------
     saved_center = tuple(state.transform.get("center_um")) \
@@ -74,18 +79,32 @@ def _run_napari(state, state_path: Path) -> None:
     tr0 = RigidTransform(
         **{k: state.transform[k] for k in
            ["rz_deg", "ry_deg", "rx_deg", "tz_um", "ty_um", "tx_um"]},
-        flip_z=bool(state.transform.get("flip_z", False)),
-        flip_y=bool(state.transform.get("flip_y", False)),
-        flip_x=bool(state.transform.get("flip_x", False)),
         center_um=saved_center,
     )
-    box = {"transform": tr0, "center_um": saved_center}
+    box = {"transform": tr0, "center_um": saved_center,
+           "ccf_data": None, "ccf_origin_um": None}
+
+    def _apply_crop_ccf():
+        b = state.ccf_crop_bbox
+        if b is None:
+            box["ccf_data"] = ccf_ref_full
+            box["ccf_origin_um"] = (0.0, 0.0, 0.0)
+        else:
+            z0, z1 = b["z"]; y0, y1 = b["y"]; x0, x1 = b["x"]
+            box["ccf_data"] = ccf_ref_full[z0:z1, y0:y1, x0:x1]
+            box["ccf_origin_um"] = (z0 * ccf.voxel_um[0],
+                                    y0 * ccf.voxel_um[1],
+                                    x0 * ccf.voxel_um[2])
+
+    _apply_crop_ccf()
+    ccf_data = box["ccf_data"]; ccf_origin = box["ccf_origin_um"]
+    b = state.ccf_crop_bbox
+    crop_voxel_origin = (np.array([b["z"][0], b["y"][0], b["x"][0]], dtype=float)
+                         if b is not None else np.zeros(3))
+    print(f"[step2] CCF crop: {ccf_data.shape} at origin {ccf_origin} µm")
     print(f"[step2] loaded transform: rz={tr0.rz_deg:+.2f} ry={tr0.ry_deg:+.2f} "
           f"rx={tr0.rx_deg:+.2f}  tz={tr0.tz_um:+.1f} ty={tr0.ty_um:+.1f} "
-          f"tx={tr0.tx_um:+.1f}  flips=("
-          f"{'z' if tr0.flip_z else '·'}"
-          f"{'y' if tr0.flip_y else '·'}"
-          f"{'x' if tr0.flip_x else '·'})", flush=True)
+          f"tx={tr0.tx_um:+.1f}", flush=True)
 
     def _resample():
         M = box["transform"].for_voxel_grid(sample_um, ccf.voxel_um)
@@ -109,17 +128,21 @@ def _run_napari(state, state_path: Path) -> None:
     sample_clim = _percentiles(sample_np)
 
     viewer = napari.Viewer(ndisplay=2, title="vol2atlas refine — refine")
-    viewer.add_image(ccf_data, name="CCF", scale=ccf.voxel_um, translate=ccf_origin,
-                     colormap="gray", contrast_limits=ccf_clim, opacity=0.5,
-                     blending="additive",
-                     interpolation2d="nearest", interpolation3d="nearest")
+    enable_ccf_axes(viewer, ccf.orientation)
+    ccf_layer = viewer.add_image(
+        ccf_data, name="CCF", scale=ccf.voxel_um, translate=ccf_origin,
+        colormap="gray", contrast_limits=ccf_clim, opacity=0.5,
+        blending="additive",
+        interpolation2d="nearest", interpolation3d="nearest")
     sample_layer = viewer.add_image(
         _resample(), name="sample (live=saved)",
         scale=ccf.voxel_um, translate=ccf_origin,
-        colormap="magenta", contrast_limits=sample_clim, opacity=0.6,
+        colormap="gray", contrast_limits=sample_clim, opacity=0.6,
         blending="additive", rendering="mip",
         interpolation2d="nearest", interpolation3d="nearest")
 
+    # 2D ortho views require data on the CCF grid (napari slices in
+    # data space). Use scipy resample, debounced.
     redraw_timer = QTimer(); redraw_timer.setSingleShot(True)
     def _redraw():
         sample_layer.data = _resample()
@@ -134,11 +157,9 @@ def _run_napari(state, state_path: Path) -> None:
     abs_lbl = QLabel(); ctrl_v.addWidget(abs_lbl)
     def _refresh_label():
         t = box["transform"]
-        flips = "".join(a for a, f in zip("zyx", (t.flip_z, t.flip_y, t.flip_x)) if f) or "—"
         abs_lbl.setText(
             f"<pre>tz={t.tz_um:+8.1f}  ty={t.ty_um:+8.1f}  tx={t.tx_um:+8.1f} µm\n"
-            f"rz={t.rz_deg:+7.2f}  ry={t.ry_deg:+7.2f}  rx={t.rx_deg:+7.2f} deg\n"
-            f"flips: {flips}</pre>"
+            f"rz={t.rz_deg:+7.2f}  ry={t.ry_deg:+7.2f}  rx={t.rx_deg:+7.2f} deg</pre>"
         )
 
     def _spin(label, default, vmin, vmax, step, setter):
@@ -188,18 +209,6 @@ def _run_napari(state, state_path: Path) -> None:
     for attr in ("rz_deg", "ry_deg", "rx_deg"):
         cur = getattr(tr0, attr)
         ctrl_v.addWidget(_spin(attr, cur, cur - R_FINE, cur + R_FINE, 0.5, _setter(attr)))
-
-    ctrl_v.addWidget(QLabel("<b>Flips</b>"))
-    flip_row = QHBoxLayout()
-    for axis in ("z", "y", "x"):
-        cb = QCheckBox(axis); cb.setChecked(getattr(tr0, f"flip_{axis}"))
-        def _mk(ax):
-            return lambda checked: (setattr(box["transform"], f"flip_{ax}", bool(checked)),
-                                     _refresh_label(), _schedule_redraw())
-        cb.stateChanged.connect(_mk(axis))
-        flip_row.addWidget(cb)
-    flip_row.addStretch(1)
-    fr = QWidget(); fr.setLayout(flip_row); ctrl_v.addWidget(fr)
 
     # --------- view-switch buttons ---------------------------------
     ctrl_v.addWidget(QLabel("<b>View</b>"))
