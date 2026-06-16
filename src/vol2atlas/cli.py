@@ -16,7 +16,13 @@ def init(
     state: Path = typer.Option(Path("state.json"), "--state", "-s"),
     level: int = typer.Option(2, "--level", "-l"),
     channel: int = typer.Option(0, "--channel", "-c"),
-    atlas: str = typer.Option("allen_mouse_25um", "--atlas"),
+    atlas: str = typer.Option(
+        "allen_mouse_25um", "--atlas",
+        help="BrainGlobe atlas name. Allen CCFv3 at: allen_mouse_10um, "
+             "_25um (default), _50um, _100um. Other mouse atlases: "
+             "kim_mouse_*, osten_mouse_*, princeton_mouse_20um, "
+             "gubra_mouse_20um, allen_mouse_bluebrain_ccfv3_augmented_*, "
+             "etc. Run `vol2atlas list-atlases` for the full set."),
     voxel_um: Optional[str] = typer.Option(
         None, "--voxel-um",
         help="Override source voxel size in µm. Single float or comma-separated z,y,x."),
@@ -399,6 +405,113 @@ def info(zarr_path: Path = typer.Argument(...)):
     except Exception as e:
         typer.secho(f"could not open zarr: {e}", fg="red", err=True); raise typer.Exit(2)
     typer.echo(ms.summary())
+
+
+@app.command("change-atlas")
+def change_atlas(
+    state: Path = typer.Argument(Path("state.json"), help="State file."),
+    to: str = typer.Option(..., "--to",
+        help="New BrainGlobe atlas name (e.g. allen_mouse_10um)."),
+):
+    """Switch the atlas in state.json (e.g. 25µm → 10µm) WITHOUT losing
+    landmarks / transform / affine.
+
+    Landmarks (sample_um, ccf_um), state.transform, and state.affine are
+    all stored in physical µm and are resolution-independent — they stay
+    valid as-is. Only ccf_crop_bbox is stored in CCF VOXEL indices and
+    must be rescaled by the new/old voxel-size ratio.
+    """
+    from .state import load as load_state, save as save_state
+    from .atlas import load_ccf
+    s = load_state(state)
+    if to == s.atlas_name:
+        typer.echo(f"atlas already = {to}; nothing to do.")
+        return
+    try:
+        old_ccf = load_ccf(s.atlas_name)
+        new_ccf = load_ccf(to)
+    except Exception as e:
+        typer.secho(f"could not load atlas: {e}", fg="red", err=True)
+        raise typer.Exit(2)
+    old_vox = old_ccf.voxel_um
+    new_vox = new_ccf.voxel_um
+    if s.ccf_crop_bbox is not None:
+        rescaled = {}
+        for axis, ov, nv in zip(("z", "y", "x"), old_vox, new_vox):
+            ratio = ov / nv
+            lo, hi = s.ccf_crop_bbox[axis]
+            rescaled[axis] = [int(round(lo * ratio)),
+                              int(round(hi * ratio))]
+        typer.echo(
+            f"ccf_crop_bbox rescaled by {old_vox} → {new_vox} µm:"
+        )
+        for axis in ("z", "y", "x"):
+            typer.echo(
+                f"  {axis}: {s.ccf_crop_bbox[axis]} → {rescaled[axis]}")
+        s.ccf_crop_bbox = rescaled
+    else:
+        typer.echo("no ccf_crop_bbox to rescale.")
+    s.atlas_name = to
+    s.add_history("change-atlas",
+                  f"{old_ccf.name} ({old_vox}) → {to} ({new_vox})")
+    save_state(s, state)
+    typer.echo(f"saved {state}: atlas → {to}")
+    typer.echo(
+        "Landmarks, transform, and affine are unchanged (physical µm).\n"
+        "Re-run any step — it'll use the new atlas resolution."
+    )
+
+
+@app.command("list-atlases")
+def list_atlases(
+    species: str = typer.Option(
+        "mouse", "--species",
+        help="Filter by species name substring (case-insensitive). "
+             "Default 'mouse'; pass empty string for all atlases."),
+    downloaded_only: bool = typer.Option(
+        False, "--downloaded",
+        help="Show only atlases already in ~/.brainglobe/ cache."),
+):
+    """List BrainGlobe atlases you can pass to `init --atlas <name>`.
+
+    Resolutions for Allen Mouse CCFv3: 10, 25 (default), 50, 100 µm.
+    Other mouse atlases include Kim Lab, Osten, Princeton, Gubra
+    (LSFM & MRI), BlueBrain CCFv3-augmented, DeMBA developmental, etc.
+    """
+    try:
+        from brainglobe_atlasapi.list_atlases import (
+            get_all_atlases_lastversions,
+            get_downloaded_atlases,
+        )
+    except ImportError as e:
+        typer.secho(f"brainglobe-atlasapi not installed: {e}",
+                    fg="red", err=True); raise typer.Exit(2)
+    try:
+        if downloaded_only:
+            entries = [(name, "") for name in get_downloaded_atlases()]
+        else:
+            data = get_all_atlases_lastversions()
+            # data is {name: version}; for richer info we'd need the
+            # remote metadata, but name + version is enough for picking.
+            entries = sorted(data.items())
+    except Exception as e:
+        typer.secho(f"failed to list atlases: {e}", fg="red", err=True)
+        raise typer.Exit(2)
+    needle = species.lower().strip()
+    if needle:
+        entries = [(n, v) for n, v in entries if needle in n.lower()]
+    if not entries:
+        typer.echo(f"(no atlases match species filter {species!r})")
+        return
+    typer.echo(f"{'atlas_name':<48}  version")
+    typer.echo("-" * 60)
+    for name, version in entries:
+        typer.echo(f"{name:<48}  {version}")
+    typer.echo()
+    typer.echo(
+        f"Pass any name to: vol2atlas init <zarr> --atlas <atlas_name>\n"
+        f"First load downloads + caches to ~/.brainglobe/ (one-time, ~MB)."
+    )
 
 
 @app.command("help-all")

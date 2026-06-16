@@ -25,17 +25,23 @@ pip install -e ".[full]"       # everything
 Every step reads and writes one `state.json`. Quit and resume any time.
 
 ```bash
-vol2atlas init  /data/sample.zarr  --level 2  --voxel-um 2.74  --orientation pir
-
-# --orientation is a 3-letter BrainGlobe code. Each letter = direction
-# the corresponding numpy axis INCREASES TOWARD: R/L, A/P, S/I.
+vol2atlas init  /data/sample.zarr  --level 2  --voxel-um 2.74 \
+                --atlas allen_mouse_25um  --orientation pir
+# --atlas defaults to allen_mouse_25um. Run `vol2atlas list-atlases`
+# for all options (Allen 10/25/50/100 µm, Kim, Osten, Princeton,
+# Gubra, BlueBrain CCFv3-augmented, etc.). Pick a coarse resolution
+# for the interactive work — see "Switching atlas resolution" below
+# to upgrade to 10 µm only for the final refinement / export.
+#
+# --orientation is a 3-letter BrainGlobe code (R/L, A/P, S/I). Each
+# letter = direction the corresponding numpy axis INCREASES TOWARD.
 # Allen CCF default is "asr". Pre-rotates the sample to match the atlas
-# so prealign opens with the sample already roughly oriented (no manual
+# so prealign opens with the sample roughly oriented (no manual
 # ±90° / 180° spinning). Sample must be right-handed; init refuses a
 # left-handed orientation (would require a flip — not supported).
 #
-# You can ALSO set it on prealign (overrides existing transform only, does
-# NOT wipe other state fields like crops / landmarks):
+# You can also set it on prealign (overrides existing transform only,
+# does NOT wipe other state fields like crops / landmarks):
 vol2atlas prealign state.json --orientation pir
 # Re-run prealign with different codes to iterate; ccf_crop_bbox and
 # everything else are preserved.
@@ -137,6 +143,43 @@ zarr://http://127.0.0.1:8000/sample_in_ccf.zarr
 ```
 
 Remote: `ssh -L 8000:127.0.0.1:8000 user@server` first.
+
+## Switching atlas resolution
+
+Landmarks (`sample_um`, `ccf_um`), `state.transform`, and `state.affine`
+are stored in physical µm and are **resolution-independent**. Only
+`state.ccf_crop_bbox` is in CCF voxel indices and must be rescaled.
+
+```bash
+# List available atlases (filtered to mouse)
+vol2atlas list-atlases
+vol2atlas list-atlases --downloaded         # only ones cached locally
+vol2atlas list-atlases --species ""         # all species
+
+# Switch atlas + auto-rescale crop bbox; landmarks unchanged
+vol2atlas change-atlas state.json --to allen_mouse_10um
+```
+
+Allen CCFv3 comes at 10, 25 (default), 50, and 100 µm. Other mouse
+atlases available: Kim Lab, Osten, Princeton (20 µm), Gubra (LSFM &
+MRI), BlueBrain CCFv3-augmented, DeMBA developmental. First load of a
+new resolution downloads + caches the atlas in `~/.brainglobe/`
+(one-time, hundreds of MB for fine resolutions).
+
+**Recommended strategy** for a final 10 µm alignment: do all the
+interactive / iterative work (prealign, refine, landmarks, Fit AFFINE)
+at the default 25 µm — napari stays responsive, ANTs runs are ~10×
+faster, and finer atlas detail doesn't help when you're picking gross
+correspondences. Then `change-atlas --to allen_mouse_10um`, optionally
+re-run `mi --affine --shape` for fine MI refinement, and `export` /
+`alignFull` to produce the 10 µm output. Cross-Allen-resolution
+landmarks survive exactly — same µm coordinates index the same
+anatomy at any voxel grid.
+
+**Cross-atlas switches** (Allen → Princeton, Allen → Gubra, etc.) are
+different reference brains with their own µm origins and label
+schemes; landmarks will NOT survive. Restart from `init` with the
+new `--atlas` if you change reference brain.
 
 ## Caveats
 

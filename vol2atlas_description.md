@@ -13,11 +13,19 @@ atlas-registered output, organized as a sequence of command-line steps
 that share a common project file. An initial alignment is performed
 through interactive 3D and orthogonal-view tools — rough positioning
 by translation and rotation sliders, fine refinement in standard
-anatomical views, and optional landmark-based correction. Landmarks
-are anchored to sample anatomy: they remain valid across successive
-fits, allowing the user to incrementally improve the registration by
-adding correspondences or removing outliers without restarting from
-scratch. Automated rigid and affine refinements based on mutual
+anatomical views, and optional landmark-based correction. A 3-letter
+orientation code provided at project initialization seeds the rough
+pose from the known scanner geometry, eliminating most manual rotation
+in the interactive step. Landmarks are anchored to sample anatomy:
+they remain valid across successive fits, allowing the user to
+incrementally improve the registration by adding correspondences or
+removing outliers without restarting from scratch. The atlas
+resolution is interchangeable on the fly: the package supports the
+Allen CCFv3 at 10, 25, 50, and 100 µm as well as alternative mouse
+references (Kim, Osten, Princeton, Gubra, BlueBrain CCFv3-augmented),
+and switching between Allen resolutions preserves all prior
+registration work because coordinates are kept in physical units
+throughout. Automated rigid and affine refinements based on mutual
 information (via the ANTs library), including a joint optimization
 that combines landmark constraints with intensity-based registration,
 further reduce residual misalignment. All interactive operations run
