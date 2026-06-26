@@ -37,6 +37,7 @@ def run(
     tps: bool = False,
     tps_smoothing: float = 0.0,
     skip_view: bool = False,
+    write_transform: bool = False,
 ) -> None:
     from scipy.ndimage import affine_transform, map_coordinates
     from ..state import load
@@ -108,10 +109,45 @@ def run(
     Minv = np.linalg.inv(M)
     offset = Minv[:3, :3] @ crop_voxel_origin + Minv[:3, 3]
     print(f"[export] resample → {ccf_data.shape}...", flush=True)
-    warped = affine_transform(
-        sample_np, Minv[:3, :3], offset=offset,
-        output_shape=ccf_data.shape, order=1, mode="constant", cval=0,
-    )
+
+    # Local refinements: if any are set in state, replace the affine_transform
+    # call with a map_coordinates call that uses a per-voxel blended source
+    # location. Pass-through (affine_transform) when no local refinements.
+    local_refs = []
+    if getattr(state, "local_refinements", None):
+        from ..local_refinement import LocalRefinement, blended_inverse_sample_coords
+        local_refs = [LocalRefinement.from_dict(d) for d in state.local_refinements]
+        print(f"[export] composing {len(local_refs)} local refinement(s): "
+              f"{[L.name for L in local_refs]}")
+
+    if local_refs:
+        # Build CCF voxel coordinate grid for the output crop, in
+        # CHUNKS to keep peak memory bounded.
+        warped = np.empty(ccf_data.shape, dtype=np.float32)
+        z_step = max(1, min(64, ccf_data.shape[0]))
+        for z0 in range(0, ccf_data.shape[0], z_step):
+            z1 = min(z0 + z_step, ccf_data.shape[0])
+            zz, yy, xx = np.meshgrid(
+                np.arange(z0, z1, dtype=np.float32),
+                np.arange(ccf_data.shape[1], dtype=np.float32),
+                np.arange(ccf_data.shape[2], dtype=np.float32),
+                indexing="ij",
+            )
+            coords = np.stack([zz, yy, xx], axis=0)   # (3, dz, Y, X)
+            sample_voxel_coords = blended_inverse_sample_coords(
+                coords, M_um, sample_um, ccf.voxel_um,
+                tuple(crop_voxel_origin * np.asarray(ccf.voxel_um)),
+                local_refinements=local_refs,
+            )
+            warped[z0:z1] = map_coordinates(
+                sample_np, sample_voxel_coords,
+                order=1, mode="constant", cval=0.0,
+            ).astype(np.float32)
+    else:
+        warped = affine_transform(
+            sample_np, Minv[:3, :3], offset=offset,
+            output_shape=ccf_data.shape, order=1, mode="constant", cval=0,
+        )
 
     # ---------- optional TPS-ON-RIGID-RESIDUALS -----------------------------
     # We do NOT fit TPS directly on ccf_µm → sample_µm — with only a handful
@@ -224,9 +260,39 @@ def run(
     _save_ngff(sample_mask, mask_zarr,   ccf.voxel_um)
     print(f"[export] wrote {sample_zarr.name} + {atlas_zarr.name} + {mask_zarr.name}")
 
+    # ---------- portable transform export ---------------------------------
+    if write_transform:
+        from ..transform_io import (
+            write_itk_mat, write_ngff_transform, write_landmarks_csv,
+        )
+        mat_path = out_dir / "transform.mat"
+        ngff_path = out_dir / "transform.json"
+        try:
+            write_itk_mat(M_um, mat_path)
+            print(f"[export] wrote {mat_path.name} "
+                  f"(ITK GenericAffine; ANTs / Slicer readable)")
+        except Exception as e:
+            print(f"[export] WARN: could not write {mat_path.name}: {e}")
+        write_ngff_transform(M_um, ccf.voxel_um, ngff_path,
+                              atlas_name=state.atlas_name,
+                              local_refinements=getattr(
+                                  state, "local_refinements", None))
+        print(f"[export] wrote {ngff_path.name} "
+              f"(OME-NGFF coordinateTransformations)")
+        if state.landmarks:
+            smp_lms = state.landmarks.get("sample_um", [])
+            ccf_lms = state.landmarks.get("ccf_um", [])
+            if smp_lms and ccf_lms:
+                csv_path = out_dir / "landmarks.csv"
+                write_landmarks_csv(smp_lms, ccf_lms, csv_path)
+                print(f"[export] wrote {csv_path.name} "
+                      f"({min(len(smp_lms), len(ccf_lms))} pairs, "
+                      f"BigWarp-format)")
+
     state.add_history(
         "export",
-        f"level={used_level} shape={list(ccf_data.shape)} tps={bool(tps)}")
+        f"level={used_level} shape={list(ccf_data.shape)} tps={bool(tps)} "
+        f"write_transform={bool(write_transform)}")
     save_state(state, state_path)
 
     if skip_view:

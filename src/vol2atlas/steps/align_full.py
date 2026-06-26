@@ -51,6 +51,14 @@ def run(
     if state.transform is None:
         raise RuntimeError("state.json has no transform — run `vol2atlas prealign` first.")
 
+    local_refs = []
+    if getattr(state, "local_refinements", None):
+        from ..local_refinement import LocalRefinement
+        local_refs = [LocalRefinement.from_dict(d)
+                      for d in state.local_refinements]
+        print(f"[alignFull] {len(local_refs)} local refinement(s): "
+              f"{[L.name for L in local_refs]}")
+
     ms  = open_multiscale(state.sample_zarr)
     ccf = load_ccf(state.atlas_name)
 
@@ -160,6 +168,11 @@ def run(
                 idx_block, chunks_out, out_shape,
                 M_v, off_v, in_zarr, in_shape, out_arr,
                 affine_transform=affine_transform,
+                local_refs=local_refs,
+                M_global_um=M_um,
+                sample_um=sample_um,
+                ccf_voxel_um=ccf.voxel_um,
+                crop_origin_voxel=crop_origin_vox,
             )
 
         from tqdm import tqdm
@@ -242,6 +255,8 @@ def _warp_one_chunk(
     idx_block, chunks_out, out_shape,
     M_v, off_v, in_zarr, in_shape, out_arr,
     *, affine_transform,
+    local_refs=(), M_global_um=None,
+    sample_um=None, ccf_voxel_um=None, crop_origin_voxel=None,
 ):
     """Compute one output chunk and write it.
 
@@ -299,10 +314,81 @@ def _warp_one_chunk(
     #             = M_v @ out_local + (M_v @ out_origin + off_v - src_min_cl)
     off_local = M_v @ out_origin + off_v - src_min_cl
 
-    warped = affine_transform(
-        src, M_v, offset=off_local,
-        output_shape=tuple(out_shape_local),
-        order=1, mode="constant", cval=0,
+    if not local_refs:
+        warped = affine_transform(
+            src, M_v, offset=off_local,
+            output_shape=tuple(out_shape_local),
+            order=1, mode="constant", cval=0,
+        ).astype(out_arr.dtype)
+        out_arr[z0:z1, y0:y1, x0:x1] = warped
+        return
+
+    # Local refinements present: compute per-voxel blended source
+    # coordinates and use map_coordinates. NOTE: the src_min/max
+    # bbox above was computed via the GLOBAL inverse only, so it may
+    # be too tight if a local refinement pulls the source somewhere
+    # outside that box. Re-derive the bbox via worst-case source
+    # locations across all of {M_global} ∪ {M_local for each L}.
+    from scipy.ndimage import map_coordinates
+    from ..local_refinement import blended_inverse_sample_coords
+    corners_out_global = corners + out_origin
+    # Output-voxel corners → output µm (relative to crop origin)
+    sample_um_arr = np.asarray(sample_um, dtype=float)
+    ccf_voxel_um_arr = np.asarray(ccf_voxel_um, dtype=float)
+    crop_origin_voxel_arr = np.asarray(crop_origin_voxel, dtype=float)
+    out_um = (corners_out_global + crop_origin_voxel_arr) * ccf_voxel_um_arr
+    # WARNING: the corners are in OUTPUT (alignFull pyramid) voxel
+    # space whose voxel size = sample_um, but they index into the
+    # ATLAS crop frame. So out_µm above = atlas µm.
+    M_inv_g = np.linalg.inv(M_global_um)
+    src_locations_um = [(M_inv_g[:3, :3] @ out_um.T).T + M_inv_g[:3, 3]]
+    for L in local_refs:
+        M_inv_l = np.linalg.inv(L.affine)
+        src_locations_um.append(
+            (M_inv_l[:3, :3] @ out_um.T).T + M_inv_l[:3, 3])
+    src_pts_vox = np.vstack([s / sample_um_arr for s in src_locations_um])
+    src_min2 = np.floor(src_pts_vox.min(axis=0)).astype(int) - 2
+    src_max2 = np.ceil(src_pts_vox.max(axis=0)).astype(int) + 2
+    src_min2_cl = np.maximum(src_min2, 0)
+    src_max2_cl = np.minimum(src_max2, np.array(in_shape))
+    if np.any(src_max2_cl <= src_min2_cl):
+        out_arr[z0:z1, y0:y1, x0:x1] = 0
+        return
+    # Re-read with the widened bounds.
+    src_wide = np.asarray(in_zarr[
+        src_min2_cl[0]:src_max2_cl[0],
+        src_min2_cl[1]:src_max2_cl[1],
+        src_min2_cl[2]:src_max2_cl[2],
+    ])
+    # Build the output-voxel grid for this chunk (in OUTPUT voxel
+    # coords WITHIN the crop, i.e., what blended_inverse_sample_coords
+    # expects).
+    zz, yy, xx = np.meshgrid(
+        np.arange(out_shape_local[0], dtype=np.float32) + out_origin[0],
+        np.arange(out_shape_local[1], dtype=np.float32) + out_origin[1],
+        np.arange(out_shape_local[2], dtype=np.float32) + out_origin[2],
+        indexing="ij",
+    )
+    coords = np.stack([zz, yy, xx], axis=0)   # (3, dz, dy, dx)
+    # blended_inverse_sample_coords expects ccf_voxel_um for the OUTPUT
+    # grid; alignFull's output voxel size IS sample_um (it's writing
+    # the warped sample into a grid whose voxels measure sample_um, in
+    # the atlas FRAME). So we pass sample_um as the output voxel size.
+    # alignFull writes its output at sample_um voxel size, so the
+    # output-grid voxel size IS sample_um. crop_origin_um is in atlas
+    # µm (crop_origin_voxel × atlas_voxel_um).
+    crop_origin_um_local = tuple(
+        np.asarray(crop_origin_voxel, dtype=float) *
+        np.asarray(ccf_voxel_um, dtype=float))
+    src_vox = blended_inverse_sample_coords(
+        coords, M_global_um, sample_um, sample_um,
+        crop_origin_um_local,
+        local_refinements=local_refs,
+    )
+    # Shift to local-source coordinates (subtract the local read origin)
+    src_vox_local = src_vox - np.asarray(src_min2_cl, dtype=float).reshape(3, 1, 1, 1)
+    warped = map_coordinates(
+        src_wide, src_vox_local, order=1, mode="constant", cval=0.0,
     ).astype(out_arr.dtype)
     out_arr[z0:z1, y0:y1, x0:x1] = warped
 

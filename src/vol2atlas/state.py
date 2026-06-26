@@ -49,6 +49,12 @@ class State:
     transform: Optional[dict] = None
     affine: Optional[list] = None        # 4x4 in CCF µm, composed after `transform`
     landmarks: dict = field(default_factory=lambda: {"sample_um": [], "ccf_um": []})
+    # Optional list of local refinements that apply ON TOP of the global
+    # transform inside a spherical region (with sigmoid falloff). Each
+    # entry: {name, center_um (sample frame), radius_um, falloff_um,
+    # affine_4x4 (sample µm → CCF µm), landmark_indices (which entries
+    # in state.landmarks contributed)}. See local_refinement.py.
+    local_refinements: list = field(default_factory=list)
     history: list = field(default_factory=list)
 
     def add_history(self, step: str, note: str = ""):

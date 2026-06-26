@@ -122,6 +122,50 @@ def _run_napari(state, state_path: Path, *,
     crop_voxel_origin = (np.array([b["z"][0], b["y"][0], b["x"][0]], dtype=float)
                          if b is not None else np.zeros(3))
 
+    # ----- TPS preview state ------------------------------------------
+    # When tps_enabled is True AND ≥4 landmark pairs are present,
+    # _resample adds a TPS correction on top of the affine baseline,
+    # using the same residuals-on-rigid pattern as step_export.run with
+    # --tps. The fit cost is O(N^3) — milliseconds for typical landmark
+    # counts (<100) — so we refit on every _resample call rather than
+    # tracking invalidation across all the sites that mutate landmarks
+    # or transforms.
+    box["tps_enabled"] = False
+    box["tps_smoothing"] = 0.0
+
+    def _invalidate_tps():
+        # Kept for API symmetry; the no-cache implementation makes it a
+        # no-op. Call sites mark "TPS state changed; please redraw" by
+        # also doing sample_layer.data = _resample().
+        pass
+
+    def _fit_tps():
+        """Fit RBFInterpolator on landmark residuals (in sample µm)
+        against the CURRENT baseline transform. Returns None if fewer
+        than 4 pairs or if the fit fails."""
+        n = min(len(landmarks_sample), len(landmarks_ccf))
+        if n < 4:
+            return None
+        from scipy.interpolate import RBFInterpolator
+        sp = np.asarray(landmarks_sample[:n], dtype=float)
+        cp = np.asarray(landmarks_ccf[:n], dtype=float)
+        M_base = box["transform"].matrix()
+        if box.get("affine_matrix") is not None:
+            M_base = box["affine_matrix"] @ M_base
+        M_base_inv = np.linalg.inv(M_base)
+        baseline_pred_sample = (M_base_inv[:3, :3] @ cp.T).T + M_base_inv[:3, 3]
+        residuals = sp - baseline_pred_sample
+        try:
+            return RBFInterpolator(
+                cp, residuals,
+                smoothing=float(box["tps_smoothing"]),
+                kernel="thin_plate_spline",
+            )
+        except Exception as e:
+            print(f"[landmarks] TPS fit failed: {e} — disabling TPS preview")
+            box["tps_enabled"] = False
+            return None
+
     def _resample():
         # Combined µm transform = (state.affine if any) @ rigid
         M_um = box["transform"].matrix()
@@ -134,10 +178,64 @@ def _run_napari(state, state_path: Path, *,
         M = S_out @ M_um @ S_in
         Minv = np.linalg.inv(M)
         offset = Minv[:3, :3] @ crop_voxel_origin + Minv[:3, 3]
-        return affine_transform(
-            sample_np, Minv[:3, :3], offset=offset,
-            output_shape=ccf_data.shape, order=0, mode="constant", cval=0,
-        )
+
+        if not box.get("tps_enabled"):
+            return affine_transform(
+                sample_np, Minv[:3, :3], offset=offset,
+                output_shape=ccf_data.shape, order=0, mode="constant", cval=0,
+            )
+
+        # TPS-on-affine-residuals path
+        tps_fn = _fit_tps()
+        if tps_fn is None:
+            return affine_transform(
+                sample_np, Minv[:3, :3], offset=offset,
+                output_shape=ccf_data.shape, order=0, mode="constant", cval=0,
+            )
+        from scipy.ndimage import map_coordinates
+        # Build per-voxel sample coords: affine baseline + TPS(ccf_um).
+        # Work in chunks along z to bound peak memory.
+        out = np.empty(ccf_data.shape, dtype=sample_np.dtype)
+        sample_um_arr = np.asarray(sample_um, dtype=float).reshape(3, 1, 1, 1)
+        ccf_voxel_um_arr = np.asarray(ccf.voxel_um, dtype=float).reshape(3, 1, 1, 1)
+        M_inv = np.linalg.inv(M_um)
+        A_inv = M_inv[:3, :3]; t_inv = M_inv[:3, 3].reshape(3, 1, 1, 1)
+        z_step = max(1, min(16, ccf_data.shape[0]))
+        for z0 in range(0, ccf_data.shape[0], z_step):
+            z1 = min(z0 + z_step, ccf_data.shape[0])
+            zz, yy, xx = np.meshgrid(
+                np.arange(z0, z1, dtype=np.float32),
+                np.arange(ccf_data.shape[1], dtype=np.float32),
+                np.arange(ccf_data.shape[2], dtype=np.float32),
+                indexing="ij",
+            )
+            coords_vox = np.stack([zz, yy, xx], axis=0)  # (3, dz, Y, X)
+            # CCF voxel → CCF µm (with crop origin)
+            ccf_um = (coords_vox + crop_voxel_origin.reshape(3, 1, 1, 1)) \
+                      * ccf_voxel_um_arr
+            # Baseline source µm = M_inv @ ccf_um
+            baseline_smp_um = np.tensordot(A_inv, ccf_um, axes=(1, 0)) + t_inv
+            # TPS correction is evaluated on CCF µm query points; returns
+            # sample-µm shift to add. Reshape ccf_um to (N, 3) for the call.
+            ccf_um_pts = np.moveaxis(ccf_um, 0, -1).reshape(-1, 3)
+            try:
+                shifts = tps_fn(ccf_um_pts).reshape(
+                    z1 - z0, ccf_data.shape[1], ccf_data.shape[2], 3)
+            except Exception as e:
+                print(f"[landmarks] TPS eval failed: {e} — falling back to "
+                      f"affine for this redraw")
+                return affine_transform(
+                    sample_np, Minv[:3, :3], offset=offset,
+                    output_shape=ccf_data.shape, order=0,
+                    mode="constant", cval=0,
+                )
+            shifts = np.moveaxis(shifts, -1, 0)  # (3, dz, Y, X)
+            smp_um = baseline_smp_um + shifts
+            smp_vox = smp_um / sample_um_arr
+            out[z0:z1] = map_coordinates(
+                sample_np, smp_vox, order=0, mode="constant", cval=0,
+            ).astype(sample_np.dtype)
+        return out
 
     # --------- napari viewer + layers ----------------------------------
     def _percentiles(a, lo=1, hi=99.5):
@@ -253,6 +351,11 @@ def _run_napari(state, state_path: Path, *,
             print(f"[step3] + CCF    #{len(landmarks_ccf)-1}: ccf_µm={tuple(round(w,1) for w in world)}",
                   flush=True)
         _refresh_lists()
+        # If TPS preview is enabled, refit on the new landmark set and
+        # re-render. Cheap for typical landmark counts (<100).
+        _invalidate_tps()
+        if box.get("tps_enabled"):
+            sample_layer.data = _resample()
 
     # --------- controls panel -----------------------------------------
     ctrl = QWidget(); ctrl_v = QVBoxLayout(ctrl)
@@ -301,6 +404,9 @@ def _run_napari(state, state_path: Path, *,
         for r in rows:
             if 0 <= r < len(store): store.pop(r)
         refresh(); _refresh_lists()
+        _invalidate_tps()
+        if box.get("tps_enabled"):
+            sample_layer.data = _resample()
     sdel.clicked.connect(lambda: _del("sample"))
     cdel.clicked.connect(lambda: _del("ccf"))
 
@@ -394,6 +500,41 @@ def _run_napari(state, state_path: Path, *,
         viewer.status = (f"affine fit: {n} pairs, RMS {rms:.0f} µm — see terminal")
     fit_aff_btn.clicked.connect(_fit_affine)
     ctrl_v.addWidget(fit_aff_btn)
+
+    # --------- TPS live preview ---------------------------------------
+    # When enabled, the sample image layer is rendered with a
+    # thin-plate-spline correction layered on top of the affine
+    # baseline (residuals at landmark positions are interpolated via
+    # scipy RBFInterpolator). Recomputed on every redraw — refit cost
+    # is ~ms for typical landmark counts.
+    from qtpy.QtWidgets import QDoubleSpinBox as _QDoubleSpinBox
+    tps_row = QHBoxLayout()
+    cb_tps = QCheckBox("Live TPS preview")
+    tps_row.addWidget(cb_tps)
+    tps_row.addWidget(QLabel("smoothing:"))
+    tps_sb = _QDoubleSpinBox()
+    tps_sb.setRange(0.0, 1e6); tps_sb.setDecimals(2); tps_sb.setSingleStep(1.0)
+    tps_sb.setValue(0.0)
+    tps_row.addWidget(tps_sb)
+    tps_row.addStretch(1)
+    tw = QWidget(); tw.setLayout(tps_row); ctrl_v.addWidget(tw)
+
+    def _on_tps_toggled(checked):
+        box["tps_enabled"] = bool(checked)
+        n = min(len(landmarks_sample), len(landmarks_ccf))
+        if checked and n < 4:
+            viewer.status = (f"TPS preview needs ≥4 landmark pairs "
+                              f"(have {n}); will activate once you have enough")
+        else:
+            viewer.status = (f"TPS preview {'ON' if checked else 'OFF'}")
+        sample_layer.data = _resample()
+    cb_tps.stateChanged.connect(_on_tps_toggled)
+
+    def _on_tps_smoothing(v):
+        box["tps_smoothing"] = float(v)
+        if box.get("tps_enabled"):
+            sample_layer.data = _resample()
+    tps_sb.valueChanged.connect(_on_tps_smoothing)
 
     # Revert: undo the last fit (pops one snapshot off the stack)
     revert_btn = QPushButton("Revert last fit")
@@ -611,8 +752,87 @@ def _run_napari(state, state_path: Path, *,
     def _clear_all():
         landmarks_sample.clear(); landmarks_ccf.clear()
         _refresh_sample_lm_display(); _refresh_ccf_lm_display(); _refresh_lists()
+        if box.get("tps_enabled"):
+            sample_layer.data = _resample()
     clear_btn.clicked.connect(_clear_all)
     ctrl_v.addWidget(clear_btn)
+
+    # --------- import / export landmarks ------------------------------
+    # Round-trip pairs through external files (CSV BigWarp-format or
+    # vol2atlas JSON). Coordinates are PHYSICAL µm — atlas-resolution
+    # invariant. Useful for sharing, version control, or pre-picking
+    # landmarks in another tool.
+    from qtpy.QtWidgets import QFileDialog
+    io_row = QHBoxLayout()
+    import_btn = QPushButton("Import landmarks…")
+    export_btn = QPushButton("Export landmarks…")
+    io_row.addWidget(import_btn); io_row.addWidget(export_btn)
+    iow = QWidget(); iow.setLayout(io_row); ctrl_v.addWidget(iow)
+
+    def _do_import():
+        from ..transform_io import read_landmarks_csv
+        import json as _json
+        path, _ = QFileDialog.getOpenFileName(
+            None, "Import landmarks", "",
+            "Landmarks (*.csv *.json);;CSV (*.csv);;JSON (*.json)")
+        if not path:
+            return
+        p = Path(path)
+        if p.suffix.lower() == ".csv":
+            smp, ccf = read_landmarks_csv(p)
+        elif p.suffix.lower() == ".json":
+            d = _json.loads(p.read_text())
+            smp = [tuple(pt) for pt in d.get("sample_um", [])]
+            ccf = [tuple(pt) for pt in d.get("ccf_um", [])]
+        else:
+            viewer.status = f"unknown format {p.suffix}; use .csv or .json"
+            return
+        n = min(len(smp), len(ccf))
+        if n == 0:
+            viewer.status = f"no usable pairs in {p.name}"
+            return
+        # Replace; append is rare and ambiguous in GUI.
+        landmarks_sample.clear(); landmarks_ccf.clear()
+        for s_pt in smp[:n]:
+            landmarks_sample.append(tuple(float(v) for v in s_pt))
+        for c_pt in ccf[:n]:
+            landmarks_ccf.append(tuple(float(v) for v in c_pt))
+        _refresh_sample_lm_display(); _refresh_ccf_lm_display()
+        _refresh_lists()
+        if box.get("tps_enabled"):
+            sample_layer.data = _resample()
+        viewer.status = f"imported {n} pairs from {p.name}"
+        print(f"[landmarks] imported {n} pairs from {p}", flush=True)
+    import_btn.clicked.connect(_do_import)
+
+    def _do_export():
+        from ..transform_io import write_landmarks_csv
+        import json as _json
+        n = min(len(landmarks_sample), len(landmarks_ccf))
+        if n == 0:
+            viewer.status = "no landmarks to export"
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            None, "Export landmarks",
+            str(state_path.parent / "landmarks.csv"),
+            "CSV BigWarp (*.csv);;JSON (*.json)")
+        if not path:
+            return
+        p = Path(path)
+        if p.suffix.lower() == ".json":
+            p.write_text(_json.dumps({
+                "sample_um": [list(pt) for pt in landmarks_sample[:n]],
+                "ccf_um":    [list(pt) for pt in landmarks_ccf[:n]],
+            }, indent=2))
+        else:
+            # Default to CSV for anything else (incl. extensionless)
+            if p.suffix.lower() != ".csv":
+                p = p.with_suffix(".csv")
+            write_landmarks_csv(
+                landmarks_sample[:n], landmarks_ccf[:n], p)
+        viewer.status = f"exported {n} pairs → {p.name}"
+        print(f"[landmarks] exported {n} pairs → {p}", flush=True)
+    export_btn.clicked.connect(_do_export)
 
     # View buttons
     ctrl_v.addWidget(QLabel("<b>View</b>"))

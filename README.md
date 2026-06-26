@@ -3,6 +3,27 @@
 Align large OME-Zarr volumes (µCT, light-sheet, EM, …) to the Allen Mouse
 CCF — or to any other OME-Zarr reference — through one CLI.
 
+## Contents
+
+- [Install](#install) — base + optional engines
+- [Use](#use) — canonical end-to-end pipeline
+- [Atlas selection & switching resolution](#switching-atlas-resolution) —
+  `list-atlases`, `change-atlas`
+- [Import / export landmarks](#import--export-landmarks) — round-trip
+  external CSV / JSON
+- [Live TPS preview in landmarks](#live-tps-preview-in-landmarks) —
+  see deformable warp while picking
+- [Local refinements (masked transforms)](#local-refinements-masked-transforms)
+  — fix one region without disturbing the rest
+- [Portable transform export](#portable-transform-export) — emit ITK
+  `.mat` / OME-NGFF `.json`; reapply with `apply-transform`
+- [Landmarks workflow tips](#landmarks-workflow) — iterating without
+  blowing up the fit
+- [Caveats](#caveats)
+- [EM (Stage B) roadmap](#em-stage-b-roadmap-not-implemented)
+
+Full per-command help: `vol2atlas help-all`.
+
 ## Install
 
 ```bash
@@ -63,18 +84,32 @@ vol2atlas mi        state.json --affine   # global 12-DOF MI on intensity / shap
 # In the landmarks GUI you can also run MI / JOINT MI+landmarks
 # (single-shot or iterative) directly via buttons. Those run IN-MEMORY:
 # state.json is only written when you click an explicit Save button.
+# See "Live TPS preview" and "Local refinements" sections below for the
+# in-GUI deformable preview and the masked-transform tools.
 
 # downsampled QC output
 vol2atlas export    state.json -o out/rigid
-vol2atlas export    state.json -o out/tps --tps     # rigid + TPS on residuals
+vol2atlas export    state.json -o out/tps     --tps              # rigid + TPS on residuals
+vol2atlas export    state.json -o out/portable --write-transform # +transform.mat/json/landmarks.csv
 
 # optional DEFORMABLE refinement on top of an export
 vol2atlas ants      out/rigid -o out/ants
 vol2atlas elastix   out/rigid -o out/elastix
 vol2atlas brainreg  out/rigid -o out/brainreg
 
-# apply rigid (+ affine if present) to the FULL OME-Zarr at every pyramid level
+# apply rigid (+ affine + local refinements) to the FULL OME-Zarr at every pyramid level
 vol2atlas alignFull state.json -o /data/big/sample_in_ccf.zarr
+
+# Reapply a saved transform to a different channel / volume (no state.json needed)
+vol2atlas apply-transform out/portable/transform.mat /data/other_channel.zarr \
+                          --out /data/other_channel_in_ccf.zarr
+
+# Share / version-control / regenerate landmarks externally
+vol2atlas landmarks-export state.json -o landmarks.csv
+vol2atlas landmarks-import state.json landmarks.csv
+
+# Upgrade to a finer atlas WITHOUT losing landmarks
+vol2atlas change-atlas     state.json --to allen_mouse_10um
 ```
 
 Each refinement command writes the same layout under `out/<dir>/`:
@@ -94,7 +129,7 @@ Full help for every subcommand (args, options, defaults):
 vol2atlas help-all
 ```
 
-## EM (Stage B) — ROADMAP, not implemented
+## EM (Stage B) roadmap, not implemented
 
 > **Not in `main`.** The `--reference` flag on `init`, `alignFull --tps`,
 > and the voxel-size-aware UI are all unmerged. No EM data has been run
@@ -181,6 +216,138 @@ different reference brains with their own µm origins and label
 schemes; landmarks will NOT survive. Restart from `init` with the
 new `--atlas` if you change reference brain.
 
+## Import / export landmarks
+
+Landmarks can be round-tripped through external files in physical µm
+(so the same file works at any atlas resolution). Two formats:
+
+- **BigWarp CSV** (`.csv`): one row per pair, columns
+  `Pt-i,True,sx,sy,sz,cx,cy,cz` — readable by BigWarp's File ›
+  Import landmarks. Note the column order is `(x,y,z)` while
+  vol2atlas tuples are `(z,y,x)`; the swap is handled on read/write.
+- **vol2atlas JSON** (`.json`): `{"sample_um": [[z,y,x], ...],
+  "ccf_um": [[z,y,x], ...]}` — straight dump of `state.landmarks`.
+
+CLI:
+
+```bash
+vol2atlas landmarks-export state.json -o landmarks.csv      # or .json
+vol2atlas landmarks-import state.json landmarks.csv          # mode=replace
+vol2atlas landmarks-import state.json more.csv --mode append # merge
+```
+
+In the landmarks GUI: **Import landmarks…** and **Export landmarks…**
+buttons (under "Clear ALL landmarks") open a file dialog. Importing
+in the GUI always replaces the current set.
+
+Use cases: share a labeled set with a collaborator, version-control
+your picks, pre-pick in BigWarp / a custom tool, regenerate after a
+`change-atlas` to a different reference brain (note: landmarks made
+in one atlas's µm frame are NOT valid in a different brain's frame —
+they survive Allen resolution changes but NOT cross-atlas switches).
+
+## Live TPS preview in landmarks
+
+In the landmarks GUI there's now a **"Live TPS preview"** checkbox with
+a smoothing spinbox. When checked AND there are ≥4 landmark pairs, the
+sample image layer renders with a thin-plate-spline correction layered
+on top of the current affine baseline — same math `export --tps` uses,
+but applied live on the crop preview. As you add landmarks / delete
+outliers / refit, the TPS warp updates so you can see how a deformable
+final would look before committing to one at export time.
+
+The TPS is fit on **landmark residuals** (`sample_µm − M_base⁻¹ · ccf_µm`)
+and applied as a per-voxel shift on top of the affine source. Far from
+landmarks the shift → 0 and the affine warp is preserved; at landmark
+positions the warped sample lands exactly on the CCF target.
+
+Toggling the checkbox OFF restores the standard affine warp instantly.
+Refit cost is ~ms for typical landmark counts (<100); rendering cost
+scales with the crop voxel budget (`--preview-size`), capped at
+~7M voxels by default.
+
+The preview does not persist — it's a visualization only. To bake the
+TPS into the output, run `vol2atlas export state.json -o out/tps
+--tps` after Save.
+
+## Local refinements (masked transforms)
+
+Sometimes the global rigid+affine lands the whole brain correctly but
+one region (e.g., one cortical lobe, a single subcortical structure)
+is still slightly off. Re-fitting the global transform would help that
+region but would degrade the rest. **Local refinements** apply an
+extra affine *only inside a sphere* around chosen landmarks, with a
+smooth sigmoid blend at the boundary so the rest of the volume is
+unchanged.
+
+```bash
+# 1. Pick landmarks normally (vol2atlas landmarks ...). Pay attention
+#    to which indices are in the region you want to refine — the
+#    landmarks step prints them as you click:
+#      [step3] + SAMPLE #5: world=... -> sample_µm=...
+
+# 2. Add a local refinement using landmark indices 5,6,7,8,9 (≥4 pairs):
+vol2atlas add-local-refinement state.json --name left_lobe \
+        --landmarks 5,6,7,8,9 \
+        --falloff-um 300 --radius-pad-um 200
+
+# 3. Inspect what's set
+vol2atlas list-local-refinements state.json
+
+# 4. export / alignFull automatically compose any local refinements
+#    on top of the global transform:
+vol2atlas export state.json -o out/refined --write-transform
+vol2atlas alignFull state.json -o /data/big/sample_in_ccf.zarr
+
+# 5. Remove if you don't like it (no other state touched)
+vol2atlas remove-local-refinement state.json --name left_lobe
+```
+
+**Math**: each local refinement defines a sphere in SAMPLE µm (center
++ radius derived from the chosen landmarks' centroid + max distance +
+`--radius-pad-um`), and an extra affine fit ONLY from those
+landmarks. At warp time, for each output voxel Q in atlas µm:
+
+```
+w(Q)              = sigmoid((radius - distance_to_center) / (falloff/4))
+global_source(Q)  = M_global⁻¹ · Q
+local_source(Q)   = M_local⁻¹  · Q
+blended_source(Q) = (1 − w(Q)) · global_source + w(Q) · local_source
+```
+
+`w` ≈ 1 inside the sphere, ≈ 0 outside the sphere + falloff zone,
+smooth in between. Multiple refinements stack (each one is evaluated
+against the previously-blended source, so non-overlapping spheres
+behave independently; overlapping spheres compose in sequence).
+
+Local refinements travel with the portable transform: `export
+--write-transform` writes them into the `transform.json` (under
+`local_refinements`), and `vol2atlas apply-transform <transform.json>`
+honors them when warping a different volume.
+
+## Portable transform export
+
+`state.json` carries the registration internally, but other tools
+(ANTs, Slicer, BigWarp, custom Python scripts) don't read it. To emit
+the transform as standalone files:
+
+```bash
+vol2atlas export state.json -o out/rigid --write-transform
+# Adds to out/rigid/:
+#   transform.mat        ITK GenericAffine (readable by antsApplyTransforms)
+#   transform.json       OME-NGFF coordinateTransformations
+#   landmarks.csv        sample/CCF pairs, BigWarp-format
+
+# Reapply the saved transform to a different channel or acquisition:
+vol2atlas apply-transform out/rigid/transform.mat /data/other_channel.zarr \
+                          --out /data/other_channel_in_ccf.zarr \
+                          --out-voxel-um 25,25,25
+```
+
+Both `.mat` and `.json` formats are accepted by `apply-transform`. The
+`.json` includes atlas voxel size so `--out-voxel-um` is optional with
+it; the `.mat` is voxel-info-free (ITK convention) so you must specify.
+
 ## Caveats
 
 - Partial-hemisphere samples: use the rigid + TPS path. `brainreg` and
@@ -189,15 +356,24 @@ new `--atlas` if you change reference brain.
   print as 0.97–1.03 you've found a small real scale fix; if they
   diverge to e.g. 0.5 or 2.0 the optimizer over-fit — Revert in the
   preview and your `state.affine` stays unchanged.
-- `alignFull` applies rigid + affine if both are set; deformable
-  composition (TPS / B-spline) is not yet integrated.
+- `alignFull` applies rigid + affine + local refinements when present;
+  full-volume TPS / B-spline composition is not yet integrated (use the
+  `out/tps` export or a downstream `ants` / `elastix` run for that).
 - The CCF crop bbox from `prealign` is a HARD output frame for
   `export` and `alignFull` — sample voxels outside the crop are
   clipped. Expand the crop in `prealign` if you need more headroom.
   Interactive previews show the full sample so you can spot clipping.
-- Prealign/refine UI now only exposes **translation + rotation** (no
+- Prealign/refine UI exposes only **translation + rotation** (no
   axis-flip checkboxes). Rotation sliders run −180°…+180°, which
-  covers any orientation that flips would have covered.
+  covers any orientation that flips would have covered. If your
+  sample is left-handed relative to the atlas (det < 0), `init
+  --orientation` will refuse — pre-flip one axis of the sample data
+  on disk first.
+- Sample landmarks are stored in **raw sample µm** and reference the
+  full transform (`state.affine ∘ state.transform`); they survive
+  Allen-resolution switches (`change-atlas`) exactly. They do NOT
+  survive a different reference brain (Princeton, Gubra, etc.) —
+  different µm origin.
 
 ## Landmarks workflow
 
