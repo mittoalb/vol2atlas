@@ -507,9 +507,10 @@ def _run_napari(state, state_path: Path, *,
     # baseline (residuals at landmark positions are interpolated via
     # scipy RBFInterpolator). Recomputed on every redraw — refit cost
     # is ~ms for typical landmark counts.
-    from qtpy.QtWidgets import QDoubleSpinBox as _QDoubleSpinBox
+    from qtpy.QtWidgets import (QDoubleSpinBox as _QDoubleSpinBox,
+                                 QCheckBox as _QCheckBox)
     tps_row = QHBoxLayout()
-    cb_tps = QCheckBox("Live TPS preview")
+    cb_tps = _QCheckBox("Live TPS preview")
     tps_row.addWidget(cb_tps)
     tps_row.addWidget(QLabel("smoothing:"))
     tps_sb = _QDoubleSpinBox()
