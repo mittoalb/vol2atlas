@@ -85,10 +85,15 @@ def _run_napari(state, state_path: Path, *,
            ["rz_deg", "ry_deg", "rx_deg", "tz_um", "ty_um", "tx_um"]},
         center_um=saved_center,
     )
+    # Hydrate local refinements from state (list of LocalRefinement dataclass
+    # instances; persisted back as dicts in the Save handlers).
+    from ..local_refinement import LocalRefinement
     box = {"transform": tr0, "center_um": saved_center,
            "ccf_data": None, "ccf_origin_um": None,
            "affine_matrix": (np.asarray(state.affine, dtype=float)
                               if state.affine is not None else None),
+           "local_refinements": [LocalRefinement.from_dict(d)
+                                  for d in (state.local_refinements or [])],
            # Undo stack: list of (transform_dict, affine_matrix-or-None)
            # snapshots, pushed BEFORE each Fit operation.
            "undo_stack": []}
@@ -179,13 +184,60 @@ def _run_napari(state, state_path: Path, *,
         Minv = np.linalg.inv(M)
         offset = Minv[:3, :3] @ crop_voxel_origin + Minv[:3, 3]
 
-        if not box.get("tps_enabled"):
+        local_refs = box.get("local_refinements") or []
+        if not box.get("tps_enabled") and not local_refs:
             return affine_transform(
                 sample_np, Minv[:3, :3], offset=offset,
                 output_shape=ccf_data.shape, order=0, mode="constant", cval=0,
             )
 
-        # TPS-on-affine-residuals path
+        # If we have local refinements (with or without TPS), use the
+        # blended_inverse_sample_coords path so the preview matches what
+        # export / alignFull produce. TPS, when enabled, is layered on
+        # top of the blended sample coords.
+        if local_refs:
+            from scipy.ndimage import map_coordinates
+            from ..local_refinement import blended_inverse_sample_coords
+            tps_fn = _fit_tps() if box.get("tps_enabled") else None
+            out = np.empty(ccf_data.shape, dtype=sample_np.dtype)
+            sample_um_arr = np.asarray(sample_um, dtype=float).reshape(3, 1, 1, 1)
+            ccf_voxel_um_arr = np.asarray(ccf.voxel_um, dtype=float).reshape(3, 1, 1, 1)
+            crop_origin_um_local = tuple(
+                np.asarray(crop_voxel_origin, dtype=float) *
+                np.asarray(ccf.voxel_um, dtype=float))
+            z_step = max(1, min(16, ccf_data.shape[0]))
+            for z0 in range(0, ccf_data.shape[0], z_step):
+                z1 = min(z0 + z_step, ccf_data.shape[0])
+                zz, yy, xx = np.meshgrid(
+                    np.arange(z0, z1, dtype=np.float32),
+                    np.arange(ccf_data.shape[1], dtype=np.float32),
+                    np.arange(ccf_data.shape[2], dtype=np.float32),
+                    indexing="ij",
+                )
+                coords = np.stack([zz, yy, xx], axis=0)
+                smp_vox = blended_inverse_sample_coords(
+                    coords, M_um, sample_um, ccf.voxel_um,
+                    crop_origin_um_local,
+                    local_refinements=local_refs,
+                )
+                if tps_fn is not None:
+                    # Add TPS shift in µm on top of the blended source µm.
+                    ccf_um = (coords + crop_voxel_origin.reshape(3, 1, 1, 1)) \
+                              * ccf_voxel_um_arr
+                    ccf_um_pts = np.moveaxis(ccf_um, 0, -1).reshape(-1, 3)
+                    try:
+                        shifts = tps_fn(ccf_um_pts).reshape(
+                            z1 - z0, ccf_data.shape[1], ccf_data.shape[2], 3)
+                        shifts = np.moveaxis(shifts, -1, 0)
+                        smp_vox = smp_vox + shifts / sample_um_arr
+                    except Exception as e:
+                        print(f"[landmarks] TPS eval failed: {e}")
+                out[z0:z1] = map_coordinates(
+                    sample_np, smp_vox, order=0, mode="constant", cval=0,
+                ).astype(sample_np.dtype)
+            return out
+
+        # TPS-on-affine-residuals path (no local refinements)
         tps_fn = _fit_tps()
         if tps_fn is None:
             return affine_transform(
@@ -537,6 +589,108 @@ def _run_napari(state, state_path: Path, *,
             sample_layer.data = _resample()
     tps_sb.valueChanged.connect(_on_tps_smoothing)
 
+    # --------- Local refinements (masked transforms) ------------------
+    # Multi-select rows in the sample/CCF lists, choose name + falloff,
+    # click "Add local refinement". List below shows existing ones with
+    # Remove buttons. Preview re-renders so you see the masked
+    # correction immediately.
+    from qtpy.QtWidgets import (QLineEdit as _QLineEdit,
+                                 QDoubleSpinBox as _QDSpin,
+                                 QListWidget as _QListW)
+    from ..local_refinement import fit_from_landmarks
+    ctrl_v.addWidget(QLabel("<b>Local refinement (masked affine)</b>"))
+    lr_name_row = QHBoxLayout()
+    lr_name_row.addWidget(QLabel("name:"))
+    lr_name_edit = _QLineEdit(); lr_name_edit.setPlaceholderText("e.g. left_lobe")
+    lr_name_row.addWidget(lr_name_edit)
+    lr_name_row.addWidget(QLabel("falloff µm:"))
+    lr_falloff_sb = _QDSpin(); lr_falloff_sb.setRange(10.0, 5000.0)
+    lr_falloff_sb.setDecimals(0); lr_falloff_sb.setSingleStep(50.0)
+    lr_falloff_sb.setValue(300.0)
+    lr_name_row.addWidget(lr_falloff_sb)
+    lr_name_row.addWidget(QLabel("pad µm:"))
+    lr_pad_sb = _QDSpin(); lr_pad_sb.setRange(0.0, 5000.0)
+    lr_pad_sb.setDecimals(0); lr_pad_sb.setSingleStep(50.0); lr_pad_sb.setValue(200.0)
+    lr_name_row.addWidget(lr_pad_sb)
+    lrn_w = QWidget(); lrn_w.setLayout(lr_name_row); ctrl_v.addWidget(lrn_w)
+
+    lr_add_btn = QPushButton(
+        "Add local refinement from selected landmark rows (≥4)")
+    lr_list_w = _QListW(); lr_list_w.setMaximumHeight(100)
+    lr_remove_btn = QPushButton("Remove selected local refinement")
+    ctrl_v.addWidget(lr_add_btn)
+    ctrl_v.addWidget(lr_list_w)
+    ctrl_v.addWidget(lr_remove_btn)
+
+    def _refresh_lr_list():
+        lr_list_w.clear()
+        for L in box["local_refinements"]:
+            c = L.center_um
+            lr_list_w.addItem(
+                f"{L.name}: center=({c[0]:.0f},{c[1]:.0f},{c[2]:.0f}) µm "
+                f"radius={L.radius_um:.0f} fall={L.falloff_um:.0f} "
+                f"lms={L.landmark_indices}")
+    _refresh_lr_list()
+
+    def _selected_landmark_indices():
+        rows = sorted({i.row() for i in sample_list.selectedIndexes()}
+                       | {i.row() for i in ccf_list.selectedIndexes()})
+        n_total = min(len(landmarks_sample), len(landmarks_ccf))
+        return [r for r in rows if 0 <= r < n_total]
+
+    def _add_local_refinement():
+        name = lr_name_edit.text().strip()
+        if not name:
+            viewer.status = "give the local refinement a name"
+            return
+        if any(L.name == name for L in box["local_refinements"]):
+            viewer.status = f"name {name!r} already used; pick another"
+            return
+        idx = _selected_landmark_indices()
+        if len(idx) < 4:
+            viewer.status = (f"select ≥4 landmark rows in the sample OR "
+                              f"CCF list (have {len(idx)})")
+            return
+        sp = np.asarray([landmarks_sample[i] for i in idx], dtype=float)
+        cp = np.asarray([landmarks_ccf[i]    for i in idx], dtype=float)
+        try:
+            L = fit_from_landmarks(
+                sp, cp, name=name,
+                falloff_um=float(lr_falloff_sb.value()),
+                radius_pad_um=float(lr_pad_sb.value()),
+                landmark_indices=idx,
+            )
+        except Exception as e:
+            viewer.status = f"local refinement fit failed: {e}"
+            return
+        box["local_refinements"].append(L)
+        S = np.linalg.svd(L.affine[:3, :3], compute_uv=False).tolist()
+        print(f"[landmarks] added local refinement {name!r}: "
+              f"{len(idx)} lms, center {L.center_um}, "
+              f"radius {L.radius_um:.0f} µm, fall {L.falloff_um:.0f} µm, "
+              f"SVD {S}", flush=True)
+        lr_name_edit.clear()
+        _refresh_lr_list()
+        sample_layer.data = _resample()
+        viewer.status = (f"added local refinement {name!r} "
+                          f"({len(idx)} landmarks); preview updated")
+    lr_add_btn.clicked.connect(_add_local_refinement)
+
+    def _remove_local_refinement():
+        rows = sorted({i.row() for i in lr_list_w.selectedIndexes()},
+                       reverse=True)
+        if not rows:
+            viewer.status = "select a local refinement row to remove"
+            return
+        for r in rows:
+            if 0 <= r < len(box["local_refinements"]):
+                removed = box["local_refinements"].pop(r)
+                print(f"[landmarks] removed local refinement "
+                      f"{removed.name!r}", flush=True)
+        _refresh_lr_list()
+        sample_layer.data = _resample()
+    lr_remove_btn.clicked.connect(_remove_local_refinement)
+
     # Revert: undo the last fit (pops one snapshot off the stack)
     revert_btn = QPushButton("Revert last fit")
     def _revert():
@@ -737,11 +891,16 @@ def _run_napari(state, state_path: Path, *,
             "sample_um": [list(p) for p in landmarks_sample],
             "ccf_um":    [list(p) for p in landmarks_ccf],
         }
+        state.local_refinements = [L.to_dict() for L
+                                    in box.get("local_refinements", [])]
         has_affine = box.get("affine_matrix") is not None
+        n_lr = len(state.local_refinements)
         state.add_history(
             "landmarks",
             f"{len(landmarks_sample)} sample, {len(landmarks_ccf)} CCF landmarks"
-            + (f", affine fitted" if has_affine else "") + " (intermediate save)",
+            + (f", affine fitted" if has_affine else "")
+            + (f", {n_lr} local refinement(s)" if n_lr else "")
+            + " (intermediate save)",
         )
         save_state(state, state_path)
         viewer.status = f"saved -> {state_path}"
@@ -860,11 +1019,15 @@ def _run_napari(state, state_path: Path, *,
             "sample_um": [list(p) for p in landmarks_sample],
             "ccf_um":    [list(p) for p in landmarks_ccf],
         }
+        state.local_refinements = [L.to_dict() for L
+                                    in box.get("local_refinements", [])]
         has_affine = box.get("affine_matrix") is not None
+        n_lr = len(state.local_refinements)
         state.add_history(
             "landmarks",
             f"{len(landmarks_sample)} sample, {len(landmarks_ccf)} CCF landmarks"
-            + (f", affine fitted" if has_affine else ""),
+            + (f", affine fitted" if has_affine else "")
+            + (f", {n_lr} local refinement(s)" if n_lr else ""),
         )
         save_state(state, state_path)
         print(f"[step3] saved -> {state_path}", flush=True)
