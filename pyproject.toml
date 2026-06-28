@@ -36,3 +36,6 @@ vol2atlas = "vol2atlas.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+vol2atlas = ["data/ccf_landmark_presets/*.json"]

@@ -564,6 +564,92 @@ def info(zarr_path: Path = typer.Argument(...)):
     typer.echo(ms.summary())
 
 
+@app.command("landmarks-list-presets")
+def landmarks_list_presets():
+    """List built-in CCF landmark presets that ship with vol2atlas."""
+    from .landmark_presets import list_presets, preset_metadata
+    names = list_presets()
+    if not names:
+        typer.echo("(no presets shipped)")
+        return
+    for n in names:
+        try:
+            d = preset_metadata(n)
+            typer.echo(f"{n}: {d.get('n_landmarks', '?')} pts — "
+                       f"{d.get('description', '')[:80]}")
+        except Exception as e:
+            typer.echo(f"{n}: (could not load metadata: {e})")
+
+
+@app.command("landmarks-load-preset")
+def landmarks_load_preset(
+    state: Path = typer.Argument(Path("state.json"), help="State file."),
+    preset: str = typer.Option(
+        "default_v1", "--preset",
+        help="Built-in preset name (see `landmarks-list-presets`) OR "
+             "a full path to a custom JSON file."),
+    mode: str = typer.Option(
+        "append", "--mode",
+        help="'append' (default) adds preset CCF landmarks to the "
+             "existing set; 'replace' overwrites the CCF side entirely. "
+             "The sample side (sample_um) is NOT touched — you'll fill "
+             "those in next via the landmarks GUI or "
+             "`landmarks-import`."),
+):
+    """Load a curated CCF-side landmark set into state.json.
+
+    Use case: a fixed, well-distributed set of anatomical landmarks in
+    the Allen CCFv3 — the CCF coordinates never change between users,
+    so you save time by reusing them and only have to pick the
+    corresponding anatomy in YOUR sample. Resolution-independent
+    (works the same with allen_mouse_10/25/50/100 µm).
+
+    After loading, open `vol2atlas landmarks` and pick the matching
+    sample-side points in the SAME ORDER. Pair i = sample[i] ↔
+    ccf[i]. Use the existing per-pair RMS report + delete-outlier loop
+    if you need to refine.
+    """
+    from .state import load as load_state, save as save_state
+    from .landmark_presets import load_preset
+    from .atlas import load_ccf
+    s = load_state(state)
+    try:
+        ccf = load_ccf(s.atlas_name)
+    except Exception as e:
+        typer.secho(f"could not load atlas {s.atlas_name!r}: {e}",
+                    fg="red", err=True); raise typer.Exit(2)
+    try:
+        ccf_pts = load_preset(preset, ccf=ccf)
+    except (FileNotFoundError, ValueError) as e:
+        typer.secho(str(e), fg="red", err=True); raise typer.Exit(2)
+    s.landmarks = s.landmarks or {"sample_um": [], "ccf_um": []}
+    s.landmarks.setdefault("sample_um", [])
+    s.landmarks.setdefault("ccf_um", [])
+    if mode == "replace":
+        s.landmarks["ccf_um"] = [list(p) for p in ccf_pts]
+        typer.echo(f"replaced CCF landmarks with {len(ccf_pts)} from "
+                   f"preset {preset!r}")
+    elif mode == "append":
+        s.landmarks["ccf_um"].extend(list(p) for p in ccf_pts)
+        typer.echo(f"appended {len(ccf_pts)} CCF landmarks from preset "
+                   f"{preset!r}; total CCF now "
+                   f"{len(s.landmarks['ccf_um'])}")
+    else:
+        typer.secho(f"--mode must be 'replace' or 'append', got {mode!r}",
+                    fg="red", err=True); raise typer.Exit(2)
+    n_smp = len(s.landmarks["sample_um"])
+    n_ccf = len(s.landmarks["ccf_um"])
+    if n_smp < n_ccf:
+        typer.echo(
+            f"NOTE: {n_ccf - n_smp} CCF landmarks have no sample "
+            f"counterpart yet. Pick them in `vol2atlas landmarks` in "
+            f"the SAME ORDER; the i-th sample landmark pairs with "
+            f"the i-th CCF landmark.")
+    s.add_history("landmarks-load-preset",
+                   f"preset={preset} mode={mode} n_pairs={len(ccf_pts)}")
+    save_state(s, state)
+
+
 @app.command("landmarks-export")
 def landmarks_export(
     state: Path = typer.Argument(Path("state.json"), help="State file."),

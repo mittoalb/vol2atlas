@@ -297,32 +297,76 @@ def _run_napari(state, state_path: Path, *,
         a_lo, a_hi = np.percentile(f, [lo, hi])
         return float(a_lo), float(max(a_hi, a_lo + 1))
 
-    viewer = napari.Viewer(ndisplay=2, title="vol2atlas landmarks — landmarks")
-    enable_ccf_axes(viewer, ccf.orientation)
-    ccf_layer = viewer.add_image(
-        ccf_data, name="CCF", scale=ccf.voxel_um, translate=ccf_origin,
-        colormap="gray", contrast_limits=_percentiles(ccf_data),
-        opacity=0.5, blending="additive",
-        interpolation2d="nearest", interpolation3d="nearest")
-    sample_layer = viewer.add_image(
+    # ===== DUAL VIEWER LAYOUT =========================================
+    # LEFT  viewer_smp  → sample volume (warped to CCF crop frame)
+    # RIGHT viewer_ccf  → CCF reference (same crop)
+    # Both viewers carry the sample + CCF landmark point layers (mirrored
+    # data), so each side shows ALL landmarks regardless of which volume
+    # is rendered as the background image. Click on a viewer to add a
+    # landmark of that type — LEFT click → sample, RIGHT click → CCF.
+    # Dims + camera are synced via a small feedback guard.
+    # All control buttons (Fit, MI, TPS preview, local refinement, save,
+    # …) live in a single dock widget docked into the LEFT viewer.
+    viewer_smp = napari.Viewer(ndisplay=2,
+                                title="vol2atlas — sample (µCT)")
+    viewer_ccf = napari.Viewer(ndisplay=2,
+                                title="vol2atlas — CCF atlas")
+    enable_ccf_axes(viewer_smp, ccf.orientation)
+    enable_ccf_axes(viewer_ccf, ccf.orientation)
+    # `viewer` is kept as an alias for LEFT viewer so the existing
+    # controls-binding code below (which uses `viewer.status`, etc.)
+    # works without rewriting every reference.
+    viewer = viewer_smp
+
+    # Image layers — ONE per viewer (don't duplicate the sample warp).
+    sample_layer = viewer_smp.add_image(
         _resample(), name="sample (live=saved)",
         scale=ccf.voxel_um, translate=ccf_origin,
         colormap="gray", contrast_limits=_percentiles(sample_np),
-        opacity=0.6, blending="additive",
+        opacity=1.0, blending="additive",
+        interpolation2d="nearest", interpolation3d="nearest")
+    ccf_layer = viewer_ccf.add_image(
+        ccf_data, name="CCF", scale=ccf.voxel_um, translate=ccf_origin,
+        colormap="gray", contrast_limits=_percentiles(ccf_data),
+        opacity=1.0, blending="additive",
         interpolation2d="nearest", interpolation3d="nearest")
 
-    # Landmark layers (always visible)
+    # Landmark layers — mirrored across both viewers so each side shows
+    # all landmarks. `*_smp` lives in the sample viewer, `*_ccf` in the
+    # CCF viewer; refresh updates both copies with the same data.
     PHYS_LM_UM = max(80.0, ccf.voxel_um[0] * 3)   # visible dot size
-    sample_lm_layer = viewer.add_points(
+    sample_lm_layer_smp = viewer_smp.add_points(
         np.empty((0, 3)), ndim=3, scale=(1.0, 1.0, 1.0),
         name="sample landmarks", face_color="cyan",
         border_color="white", size=PHYS_LM_UM,
     )
-    ccf_lm_layer = viewer.add_points(
+    ccf_lm_layer_smp = viewer_smp.add_points(
         np.empty((0, 3)), ndim=3, scale=ccf.voxel_um,
         name="ccf landmarks", face_color="yellow",
         border_color="white", size=PHYS_LM_UM / ccf.voxel_um[0],
     )
+    sample_lm_layer_ccf = viewer_ccf.add_points(
+        np.empty((0, 3)), ndim=3, scale=(1.0, 1.0, 1.0),
+        name="sample landmarks", face_color="cyan",
+        border_color="white", size=PHYS_LM_UM,
+    )
+    ccf_lm_layer_ccf = viewer_ccf.add_points(
+        np.empty((0, 3)), ndim=3, scale=ccf.voxel_um,
+        name="ccf landmarks", face_color="yellow",
+        border_color="white", size=PHYS_LM_UM / ccf.voxel_um[0],
+    )
+    # Aliases for legacy single-viewer references in the controls code
+    # below — `sample_lm_layer`/`ccf_lm_layer` are the LEFT-viewer
+    # copies; the refresh functions update BOTH viewers in lockstep.
+    sample_lm_layer = sample_lm_layer_smp
+    ccf_lm_layer = ccf_lm_layer_smp
+
+    # Viewers are INDEPENDENT — scrolling/panning/zooming one does NOT
+    # affect the other. The point of dual viewers is to anchor one view
+    # at an anatomical feature while moving freely in the other to place
+    # the matching landmark. Sync is only applied when the user
+    # explicitly clicks a landmark row (jump-to handler — see below).
+    _sync = {"busy": False}   # kept so _jump_to_world can still gate
 
     # --------- in-memory landmark store --------------------------------
     # All coords in physical µm (sample_um in SAMPLE frame, ccf_um in CCF frame).
@@ -338,19 +382,51 @@ def _run_napari(state, state_path: Path, *,
             M = box["affine_matrix"] @ M
         return M
 
+    # Index of the row currently selected in either list; used to
+    # render that single landmark in RED so it stands out from the rest.
+    # None = no selection → all dots in the default color.
+    highlight = {"sample": None, "ccf": None}
+
     def _refresh_sample_lm_display():
-        if not landmarks_sample:
-            sample_lm_layer.data = np.empty((0, 3)); return
+        n = len(landmarks_sample)
+        if n == 0:
+            empty = np.empty((0, 3))
+            sample_lm_layer_smp.data = empty
+            sample_lm_layer_ccf.data = empty
+            return
         M = _M_full()
         pts = np.asarray(landmarks_sample)
         world = (M[:3, :3] @ pts.T).T + M[:3, 3]
-        sample_lm_layer.data = world
+        colors = np.array([[0, 1, 1, 1]] * n, dtype=float)   # cyan
+        h = highlight.get("sample")
+        if h is not None and 0 <= h < n:
+            colors[h] = [1, 0, 0, 1]                          # red
+        for layer in (sample_lm_layer_smp, sample_lm_layer_ccf):
+            layer.data = world
+            try:
+                layer.face_color = colors
+            except Exception:
+                pass
 
     def _refresh_ccf_lm_display():
-        if not landmarks_ccf:
-            ccf_lm_layer.data = np.empty((0, 3)); return
+        n = len(landmarks_ccf)
+        if n == 0:
+            empty = np.empty((0, 3))
+            ccf_lm_layer_smp.data = empty
+            ccf_lm_layer_ccf.data = empty
+            return
         pts = np.asarray(landmarks_ccf)
-        ccf_lm_layer.data = pts / np.asarray(ccf.voxel_um)
+        data = pts / np.asarray(ccf.voxel_um)
+        colors = np.array([[1, 1, 0, 1]] * n, dtype=float)   # yellow
+        h = highlight.get("ccf")
+        if h is not None and 0 <= h < n:
+            colors[h] = [1, 0, 0, 1]                          # red
+        for layer in (ccf_lm_layer_smp, ccf_lm_layer_ccf):
+            layer.data = data
+            try:
+                layer.face_color = colors
+            except Exception:
+                pass
 
     redraw_timer = QTimer(); redraw_timer.setSingleShot(True)
     def _redraw_sample():
@@ -361,71 +437,63 @@ def _run_napari(state, state_path: Path, *,
         redraw_timer.start(150)
 
     # --------- click capture for landmarks -----------------------------
-    state_lm = {"pending": None}   # None | "sample" | "ccf"
-
-    @viewer.mouse_drag_callbacks.append
-    def _click_capture(_v, event):
-        if state_lm["pending"] is None:
-            return
-        # event.position is in WORLD coords (z, y, x in µm) for 3D data
-        slice_pos = list(viewer.dims.point)
-        displayed = viewer.dims.displayed
+    def _world_from_event(v, event):
+        """Recover the (z, y, x) world µm coord of a mouse click on
+        viewer `v`, handling both 2D ortho (where event.position only
+        covers the displayed axes — the rest come from dims.point) and
+        3D mode."""
+        slice_pos = list(v.dims.point)
+        displayed = v.dims.displayed
         cursor = np.asarray(event.position, dtype=float)
         if cursor.size == len(displayed):
             for i, ax in enumerate(displayed):
                 slice_pos[ax] = float(cursor[i])
         else:
             slice_pos = [float(c) for c in cursor]
-        world = np.asarray(slice_pos)
+        return np.asarray(slice_pos)
 
-        kind = state_lm["pending"]; state_lm["pending"] = None
-        add_s_btn.setStyleSheet(""); add_c_btn.setStyleSheet("")
-
-        if kind == "sample":
-            # Map world (CCF µm) → raw sample µm via inverse of the FULL
-            # transform that _resample applies to render the sample volume.
-            # Using rigid-only here while _resample uses (affine @ rigid)
-            # makes landmarks captured AFTER an affine fit live in a
-            # different reference frame than landmarks captured BEFORE —
-            # LSQ on a mixed-frame set produces garbage.
-            M = _M_full()
-            Minv = np.linalg.inv(M)
-            s_pos = (Minv[:3, :3] @ world) + Minv[:3, 3]
-            landmarks_sample.append(tuple(float(v) for v in s_pos))
-            _refresh_sample_lm_display()
-            print(f"[step3] + SAMPLE #{len(landmarks_sample)-1}: world={tuple(round(w,1) for w in world)} "
-                  f"-> sample_µm={tuple(round(v,1) for v in s_pos)} "
-                  f"(affine={'YES' if box.get('affine_matrix') is not None else 'no'})",
-                  flush=True)
-        else:
-            landmarks_ccf.append(tuple(float(v) for v in world))
-            _refresh_ccf_lm_display()
-            print(f"[step3] + CCF    #{len(landmarks_ccf)-1}: ccf_µm={tuple(round(w,1) for w in world)}",
-                  flush=True)
-        _refresh_lists()
-        # If TPS preview is enabled, refit on the new landmark set and
-        # re-render. Cheap for typical landmark counts (<100).
+    @viewer_smp.mouse_drag_callbacks.append
+    def _click_sample(v, event):
+        """Click on the SAMPLE (LEFT) viewer → add a sample landmark."""
+        world = _world_from_event(v, event)
+        # World coord (= CCF µm) → raw SAMPLE µm via inverse of the
+        # full transform that _resample applies.
+        M = _M_full()
+        Minv = np.linalg.inv(M)
+        s_pos = (Minv[:3, :3] @ world) + Minv[:3, 3]
+        landmarks_sample.append(tuple(float(v) for v in s_pos))
+        _refresh_sample_lm_display(); _refresh_lists()
         _invalidate_tps()
         if box.get("tps_enabled"):
             sample_layer.data = _resample()
+        print(f"[step3] + SAMPLE #{len(landmarks_sample)-1}: "
+              f"world={tuple(round(w,1) for w in world)} "
+              f"-> sample_µm={tuple(round(v,1) for v in s_pos)} "
+              f"(affine={'YES' if box.get('affine_matrix') is not None else 'no'})",
+              flush=True)
+
+    @viewer_ccf.mouse_drag_callbacks.append
+    def _click_ccf(v, event):
+        """Click on the CCF (RIGHT) viewer → add a CCF landmark."""
+        world = _world_from_event(v, event)
+        landmarks_ccf.append(tuple(float(c) for c in world))
+        _refresh_ccf_lm_display(); _refresh_lists()
+        print(f"[step3] + CCF    #{len(landmarks_ccf)-1}: "
+              f"ccf_µm={tuple(round(w,1) for w in world)}",
+              flush=True)
 
     # --------- controls panel -----------------------------------------
     ctrl = QWidget(); ctrl_v = QVBoxLayout(ctrl)
     ctrl_v.setContentsMargins(4, 4, 4, 4)
 
     ctrl_v.addWidget(QLabel("<b>Pick landmarks</b>"))
-    btn_row = QHBoxLayout()
-    add_s_btn = QPushButton("+ SAMPLE (next click)")
-    add_c_btn = QPushButton("+ CCF (next click)")
-    def _arm(kind):
-        state_lm["pending"] = kind
-        viewer.status = f"click on a {kind.upper()} feature in the canvas..."
-        if kind == "sample": add_s_btn.setStyleSheet("background:#225588;")
-        else: add_c_btn.setStyleSheet("background:#886600;")
-    add_s_btn.clicked.connect(lambda: _arm("sample"))
-    add_c_btn.clicked.connect(lambda: _arm("ccf"))
-    btn_row.addWidget(add_s_btn); btn_row.addWidget(add_c_btn)
-    bw = QWidget(); bw.setLayout(btn_row); ctrl_v.addWidget(bw)
+    ctrl_v.addWidget(QLabel(
+        "Click on the <b>SAMPLE</b> viewer (LEFT) → adds a cyan sample "
+        "landmark.<br>"
+        "Click on the <b>CCF</b> viewer (RIGHT) → adds a yellow CCF "
+        "landmark.<br>"
+        "Both viewers show all dots; click a list row to highlight one."
+    ))
 
     # Two lists
     lists_row = QHBoxLayout()
@@ -447,6 +515,66 @@ def _run_napari(state, state_path: Path, *,
     cdel = QPushButton("Delete selected"); cb.addWidget(cdel)
     lists_row.addWidget(sbox); lists_row.addWidget(cbox)
     lw = QWidget(); lw.setLayout(lists_row); ctrl_v.addWidget(lw)
+
+    def _jump_to_world(world_zyx):
+        """Move BOTH viewers to a (z, y, x) world µm position.
+
+        - In 2D ortho mode: scrolls slice sliders on the non-displayed
+          axes so the point is in-plane, and centers the camera on the
+          displayed axes.
+        - In 3D mode: just centers the camera at the point.
+        Uses the sync guard so the linked dims/camera events don't
+        double-trigger.
+        """
+        z, y, x = float(world_zyx[0]), float(world_zyx[1]), float(world_zyx[2])
+        _sync["busy"] = True
+        try:
+            for v in (viewer_smp, viewer_ccf):
+                try:
+                    v.dims.point = (z, y, x)
+                except Exception:
+                    pass
+                try:
+                    v.camera.center = (z, y, x)
+                except Exception:
+                    pass
+        finally:
+            _sync["busy"] = False
+
+    def _on_sample_row_clicked(item):
+        r = sample_list.row(item)
+        if not (0 <= r < len(landmarks_sample)):
+            return
+        # sample landmarks are stored in raw SAMPLE µm; transform to world
+        # (= CCF µm) using the same _M_full() the display uses so we jump
+        # to where the dot is actually drawn.
+        smp = np.asarray(landmarks_sample[r], dtype=float)
+        M = _M_full()
+        world = (M[:3, :3] @ smp) + M[:3, 3]
+        _jump_to_world(tuple(world))
+        # Highlight the clicked landmark on both sides (the i-th sample
+        # row pairs with the i-th CCF row) so the user can find them in
+        # a dense field of dots.
+        highlight["sample"] = r
+        highlight["ccf"] = r if r < len(landmarks_ccf) else None
+        _refresh_sample_lm_display()
+        _refresh_ccf_lm_display()
+        viewer.status = f"jumped to sample #{r}"
+
+    def _on_ccf_row_clicked(item):
+        r = ccf_list.row(item)
+        if not (0 <= r < len(landmarks_ccf)):
+            return
+        # ccf landmarks are already in CCF µm = world coords
+        _jump_to_world(landmarks_ccf[r])
+        highlight["ccf"] = r
+        highlight["sample"] = r if r < len(landmarks_sample) else None
+        _refresh_sample_lm_display()
+        _refresh_ccf_lm_display()
+        viewer.status = f"jumped to ccf #{r}"
+
+    sample_list.itemClicked.connect(_on_sample_row_clicked)
+    ccf_list.itemClicked.connect(_on_ccf_row_clicked)
 
     def _del(which):
         lst, store, refresh = ((sample_list, landmarks_sample, _refresh_sample_lm_display)
@@ -922,12 +1050,58 @@ def _run_napari(state, state_path: Path, *,
     # vol2atlas JSON). Coordinates are PHYSICAL µm — atlas-resolution
     # invariant. Useful for sharing, version control, or pre-picking
     # landmarks in another tool.
-    from qtpy.QtWidgets import QFileDialog
+    from qtpy.QtWidgets import QFileDialog, QComboBox as _QComboBox
     io_row = QHBoxLayout()
     import_btn = QPushButton("Import landmarks…")
     export_btn = QPushButton("Export landmarks…")
     io_row.addWidget(import_btn); io_row.addWidget(export_btn)
     iow = QWidget(); iow.setLayout(io_row); ctrl_v.addWidget(iow)
+
+    # Built-in CCF presets: dropdown of available presets + Load button.
+    # Appends to landmarks_ccf (yellow dots); sample side stays empty
+    # for the user to pick matching anatomy in the same ORDER. Hidden
+    # if no presets shipped.
+    from ..landmark_presets import list_presets, load_preset, preset_metadata
+    _preset_names = list_presets()
+    if _preset_names:
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("CCF preset:"))
+        preset_combo = _QComboBox()
+        for n in _preset_names:
+            try:
+                meta = preset_metadata(n)
+                preset_combo.addItem(f"{n} ({meta.get('n_landmarks', '?')} pts)",
+                                      userData=n)
+            except Exception:
+                preset_combo.addItem(n, userData=n)
+        preset_row.addWidget(preset_combo)
+        load_preset_btn = QPushButton("Load CCF preset (append)")
+        preset_row.addWidget(load_preset_btn)
+        prw = QWidget(); prw.setLayout(preset_row); ctrl_v.addWidget(prw)
+
+        def _do_load_preset():
+            name = preset_combo.currentData()
+            if not name:
+                return
+            try:
+                pts = load_preset(name, ccf=ccf)
+            except Exception as e:
+                viewer.status = f"load preset failed: {e}"
+                return
+            for pt in pts:
+                landmarks_ccf.append(tuple(float(v) for v in pt))
+            _refresh_ccf_lm_display(); _refresh_lists()
+            n_smp = len(landmarks_sample)
+            n_ccf = len(landmarks_ccf)
+            unmatched = max(0, n_ccf - n_smp)
+            viewer.status = (
+                f"loaded {len(pts)} CCF landmarks from preset {name!r}; "
+                f"{unmatched} unmatched — pick matching sample anatomy "
+                f"in the SAME ORDER (i-th sample ↔ i-th CCF)")
+            print(f"[landmarks] loaded {len(pts)} CCF landmarks from "
+                  f"preset {name!r}; sample side has {n_smp}, CCF has "
+                  f"{n_ccf}, {unmatched} unmatched", flush=True)
+        load_preset_btn.clicked.connect(_do_load_preset)
 
     def _do_import():
         from ..transform_io import read_landmarks_csv
@@ -1031,13 +1205,25 @@ def _run_napari(state, state_path: Path, *,
         )
         save_state(state, state_path)
         print(f"[step3] saved -> {state_path}", flush=True)
-        viewer.close()
+        try:
+            viewer_ccf.close()
+        except Exception:
+            pass
+        viewer_smp.close()
     save_btn.clicked.connect(_save_and_exit)
     ctrl_v.addWidget(save_btn)
 
-    dock = viewer.window.add_dock_widget(ctrl, name="landmarks", area="right")
+    # Wrap the (now tall) control panel in a scroll area so the dock
+    # widget doesn't force napari taller than the screen — keeps the
+    # bottom slice slider visible no matter how many sections we add.
+    from qtpy.QtWidgets import QScrollArea as _QScrollArea
+    scroll = _QScrollArea()
+    scroll.setWidget(ctrl)
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    dock = viewer.window.add_dock_widget(scroll, name="landmarks", area="right")
     try:
-        dock.setMinimumWidth(280); dock.setMaximumWidth(900)
+        dock.setMinimumWidth(300); dock.setMaximumWidth(900)
     except Exception:
         pass
 

@@ -9,6 +9,8 @@ CCF — or to any other OME-Zarr reference — through one CLI.
 - [Use](#use) — canonical end-to-end pipeline
 - [Atlas selection & switching resolution](#switching-atlas-resolution) —
   `list-atlases`, `change-atlas`
+- [CCF landmark presets](#ccf-landmark-presets) — load a curated
+  reference set, pick matching sample anatomy
 - [Import / export landmarks](#import--export-landmarks) — round-trip
   external CSV / JSON
 - [Live TPS preview in landmarks](#live-tps-preview-in-landmarks) —
@@ -216,6 +218,51 @@ different reference brains with their own µm origins and label
 schemes; landmarks will NOT survive. Restart from `init` with the
 new `--atlas` if you change reference brain.
 
+## CCF landmark presets
+
+A curated set of CCF-side landmarks ships with the package so you
+don't have to re-pick anatomical points in the CCF every time — only
+the matching sample-side points. The CCF coordinates are fixed in
+physical µm (Allen CCFv3 frame), so they work at any resolution
+(10/25/50/100 µm) without rescaling.
+
+```bash
+vol2atlas landmarks-list-presets                    # show available
+vol2atlas landmarks-load-preset state.json          # default_v1 preset
+vol2atlas landmarks-load-preset state.json --preset default_v1 --mode replace
+vol2atlas landmarks-load-preset state.json --preset /path/to/custom.json
+```
+
+After loading, `state.landmarks.ccf_um` has the preset points but
+`sample_um` is shorter. Open `vol2atlas landmarks` and pick the
+matching sample anatomy **in the same order** — the i-th sample
+click pairs with the i-th preset CCF point. (Per-pair RMS in the
+terminal still flags outliers as you accumulate.)
+
+In the GUI: a **"Load CCF preset"** dropdown + button in the same
+panel as Import/Export landmarks does the same thing without
+quitting. Appends by default — clear the CCF list first if you
+want a fresh start.
+
+**Custom presets**: drop a JSON file anywhere and pass its path as
+`--preset /path/to/file.json`. Two schemas supported:
+
+```json
+// Allen / Neuroglancer source (the common case):
+{ "source_convention": "allen_xyz",
+  "ccf_um_xyz": [[x, y, z], ...] }     // µm in Allen's native (x, y, z) order
+
+// vol2atlas-internal (if you already converted):
+{ "source_convention": "vol2atlas_zyx",
+  "ccf_um_zyx": [[z, y, x], ...] }     // µm in our (z, y, x) order
+```
+
+For `allen_xyz`: empirically verified that BrainGlobe's `allen_mouse_*`
+arrays preserve Allen's native voxel ordering despite reporting
+orientation `"asr"` — so coordinates from Allen's Neuroglancer
+precomputed source (`gs://allen_neuroglancer_ccf/average_template_10_8bit`)
+map to vol2atlas (numpy z, y, x) via identity: no axis flips needed.
+
 ## Import / export landmarks
 
 Landmarks can be round-tripped through external files in physical µm
@@ -279,6 +326,23 @@ region but would degrade the rest. **Local refinements** apply an
 extra affine *only inside a sphere* around chosen landmarks, with a
 smooth sigmoid blend at the boundary so the rest of the volume is
 unchanged.
+
+**In the GUI (recommended)**: the landmarks step has a "Local
+refinement (masked affine)" panel:
+
+- Multi-select landmark rows in the sample OR CCF list (≥4 picks
+  inside the misaligned region)
+- Type a `name`, set `falloff µm` and `pad µm`
+- Click **Add local refinement from selected landmark rows** — the
+  sample volume preview re-renders instantly with the masked
+  correction blended in. Same composition that `export` / `alignFull`
+  will use at output time
+- A list below shows existing refinements; **Remove selected local
+  refinement** drops one
+- **Save state.json (keep window open)** or **Save state.json &&
+  exit** persists them
+
+**From the CLI** (equivalent, scriptable / headless):
 
 ```bash
 # 1. Pick landmarks normally (vol2atlas landmarks ...). Pay attention
